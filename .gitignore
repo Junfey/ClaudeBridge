@@ -1,0 +1,27 @@
+# Per-install identity — MUST NOT be committed (would leak your token/keys/subs)
+.bridge-token
+.bridge-vapid.json
+.bridge-push.json
+.bridge-url
+.bridge-subdomain
+claudebridge.log
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Bundled 3rd-party binaries from earlier experiments (not needed)
+cloudflared.exe
+ngrok.exe
+tailscale.msi
+tailscale-setup.exe
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Scratch
+tools/probe_tabs.py

@@ -1,0 +1,834 @@
+"""FastAPI bridge: REST for windows/sessions, WebSocket for streaming chat."""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+import uuid
+from pathlib import Path
+
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+UPLOAD_DIR = Path(tempfile.gettempdir()) / "claudebridge-uploads"
+MAX_FILES = 10
+
+from .claude_session import ClaudeSession, new_session, resume_session
+from .claude_storage import list_sessions, load_history
+from .vscode_windows import list_vscode_windows
+from . import vscode_cdp
+from . import jsonl_watch
+from . import claude_storage
+from . import auth
+from . import push
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+# In a PyInstaller bundle, data files live under sys._MEIPASS; from source they
+# sit next to the package. Resolve both so the exe finds web/index.html.
+if getattr(sys, "frozen", False):
+    WEB_DIR = Path(sys._MEIPASS) / "web"
+else:
+    WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+LIVE_SESSIONS: dict[str, ClaudeSession] = {}
+# target_id -> ws_url, refreshed on each /api/cdp/tabs call
+CDP_TABS: dict[str, str] = {}
+# target_id -> session title (from the tab header), refreshed on each tabs call
+CDP_TAB_TITLES: dict[str, str] = {}
+# target_id -> path of the on-disk session file it writes to (learned on send)
+CDP_SESSION: dict[str, str] = {}
+# session file -> its size the last time you read it on the phone. Used to clear
+# the "готово / unread" mark once you've seen it from the app (VS Code only
+# clears its own icon when you open the tab on the desktop).
+READ_SIZE: dict[str, int] = {}
+# session uuid -> unified tab info (rendered + sleeping tabs), built on refresh
+CDP_TABS_INFO: dict[str, dict] = {}
+# target_id -> asyncio.Lock, so inject / click / read_interactive never run
+# concurrently against the same CDP target (Electron rejects that).
+_CDP_LOCKS: dict[str, "asyncio.Lock"] = {}
+
+
+def _cdp_lock(target_id: str) -> "asyncio.Lock":
+    lock = _CDP_LOCKS.get(target_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CDP_LOCKS[target_id] = lock
+    return lock
+
+app = FastAPI(title="ClaudeBridge")
+
+
+@app.middleware("http")
+async def _require_token(request: Request, call_next):
+    """Gate /api/* behind the shared token. HTML shell and static stay public
+    (the page prompts for the token, then sends it as a header)."""
+    path = request.url.path
+    if path.startswith("/api/"):
+        provided = request.headers.get("x-bridge-key") or request.query_params.get("key")
+        if not auth.check(provided):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return await call_next(request)
+
+
+class NewSessionReq(BaseModel):
+    workspace_path: str
+
+
+class ResumeSessionReq(BaseModel):
+    workspace_path: str
+    session_id: str
+    title: str = ""
+
+
+@app.get("/api/windows")
+def get_windows() -> list[dict]:
+    """List open VS Code workspaces, with count of on-disk sessions per project."""
+    windows = list_vscode_windows()
+    by_path: dict[str, dict] = {}
+    for w in windows:
+        if not w.workspace_path:
+            continue
+        entry = by_path.setdefault(
+            w.workspace_path,
+            {
+                "workspace_path": w.workspace_path,
+                "workspace_name": w.workspace_name,
+                "window_titles": [],
+                "session_count": 0,
+            },
+        )
+        entry["window_titles"].append(w.title)
+    for path, entry in by_path.items():
+        entry["session_count"] = len(list_sessions(path, limit=200))
+    return list(by_path.values())
+
+
+@app.get("/api/projects/sessions")
+def get_project_sessions(path: str = Query(...)) -> list[dict]:
+    """List recent on-disk Claude sessions for a project."""
+    sessions = list_sessions(path, limit=30)
+    return [
+        {
+            "id": s.id,
+            "title": s.title,
+            "turns": s.turns,
+            "mtime": s.mtime,
+            "size_kb": int(s.size / 1024),
+            "live": s.id in LIVE_SESSIONS,
+        }
+        for s in sessions
+    ]
+
+
+@app.get("/api/sessions/{sid}/history")
+def get_session_history(sid: str, path: str = Query(...)) -> dict:
+    """Load chat history for a session from disk."""
+    history = load_history(sid, path)
+    return {
+        "id": sid,
+        "history": [{"role": t.role, "text": t.text, "ts": t.timestamp} for t in history],
+    }
+
+
+@app.post("/api/sessions/new")
+def create_new_session(req: NewSessionReq) -> dict:
+    if not Path(req.workspace_path).is_dir():
+        raise HTTPException(400, "workspace_path not a directory")
+    s = new_session(req.workspace_path)
+    LIVE_SESSIONS[s.id] = s
+    return {"id": s.id, "claude_session_id": s.claude_session_id, "cwd": s.cwd}
+
+
+@app.post("/api/sessions/resume")
+def create_resume_session(req: ResumeSessionReq) -> dict:
+    if not Path(req.workspace_path).is_dir():
+        raise HTTPException(400, "workspace_path not a directory")
+    if req.session_id in LIVE_SESSIONS:
+        s = LIVE_SESSIONS[req.session_id]
+    else:
+        s = resume_session(req.workspace_path, req.session_id, title=req.title)
+        LIVE_SESSIONS[s.id] = s
+    return {"id": s.id, "claude_session_id": s.claude_session_id, "cwd": s.cwd}
+
+
+@app.delete("/api/sessions/{sid}")
+def delete_session(sid: str) -> dict:
+    LIVE_SESSIONS.pop(sid, None)
+    return {"ok": True}
+
+
+@app.websocket("/ws/session/{sid}")
+async def ws_session(ws: WebSocket, sid: str) -> None:
+    if not auth.check(ws.query_params.get("key")):
+        await ws.close(code=4401)
+        return
+    await ws.accept()
+    s = LIVE_SESSIONS.get(sid)
+    if not s:
+        await ws.send_json({"type": "error", "text": "no such live session — open it first via /api/sessions/resume"})
+        await ws.close()
+        return
+    try:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                await ws.send_json({"type": "error", "text": "bad json"})
+                continue
+            if msg.get("type") != "send":
+                continue
+            text = (msg.get("text") or "").strip()
+            if not text:
+                continue
+            try:
+                async for evt in s.send(text):
+                    await ws.send_json(evt)
+                await ws.send_json({"type": "done"})
+            except Exception as e:  # noqa: BLE001
+                await ws.send_json({"type": "error", "text": str(e)})
+    except WebSocketDisconnect:
+        return
+
+
+# ── CDP: live VS Code Claude tabs ──────────────────────────────────────────
+
+
+@app.get("/api/cdp/available")
+def cdp_available() -> dict:
+    return {"available": vscode_cdp.cdp_available()}
+
+
+async def _build_claude_tabs() -> list[dict]:
+    """Unified list of ALL open Claude tabs across windows — rendered or not.
+    Identity = session uuid (JSONL stem). Rendered tabs get a ws_url for inject;
+    sleeping tabs carry their window + label so we can activate them on demand."""
+    index = claude_storage.build_title_index()
+    info: dict[str, dict] = {}
+
+    def _norm(s: str) -> str:
+        return (s or "").strip().rstrip("…").lower()
+
+    def _clean_title(s: str) -> str:
+        # With split editor groups VS Code appends ", Editor Group N" to the tab
+        # aria-label; strip it so title matching / display stay correct.
+        return re.sub(r",\s*(Editor Group|Group)\s*\d+\s*$", "", (s or "")).strip()
+
+    # 1. Every Claude editor tab (rendered or not), identified by the extension's
+    #    webview resource marker — NOT by title matching. This lists ALL Claude
+    #    tabs regardless of count (6 or 60) or whether their session is recent.
+    for wt in await vscode_cdp.list_workbench_tabs():
+        if not wt.get("claude"):
+            continue
+        # Prefer the clean .tab-label text; fall back to (de-suffixed) aria.
+        title = (wt.get("label") or "").strip() or _clean_title(wt.get("aria") or "")
+        win = wt.get("window") or ""
+        sf = claude_storage.match_title(title, index)
+        if sf is not None:
+            uid = sf.stem
+            info.setdefault(uid, {
+                "id": uid, "title": title, "session_file": str(sf), "ws_url": None,
+                "page_ws_url": wt.get("page_ws_url"), "aria": wt.get("aria") or title,
+                "window": win, "rendered": False, "_norm": _norm(title),
+                "panel": wt.get("panelId") or "", "done": bool(wt.get("done")),
+            })
+        else:
+            # No recent session file matched (old/untitled/brand-new chat). Still
+            # list it; the session file resolves via the DOM when tapped open.
+            is_fresh = title == "Claude Code"
+            panel = wt.get("panelId") or str(wt.get("index"))
+            uid = "tab:" + win + ":" + panel
+            info.setdefault(uid, {
+                "id": uid, "title": "(новый чат)" if is_fresh else (title or "(новый чат)"),
+                "session_file": None, "ws_url": None,
+                "page_ws_url": wt.get("page_ws_url"), "aria": wt.get("aria") or title,
+                "window": win, "rendered": False, "_norm": _norm(title),
+                "panel": wt.get("panelId") or "", "done": bool(wt.get("done")),
+            })
+
+    # 2. Rendered webviews → attach ws_url (enables inject/mirror immediately).
+    #    Correlate by session file when known, else by normalized title.
+    for rt in await vscode_cdp.list_claude_tabs():
+        sf = claude_storage.match_title(rt.title, index)
+        target = None
+        if sf is not None and sf.stem in info:
+            target = info[sf.stem]
+        else:
+            rn = _norm(rt.title)
+            for e in info.values():
+                if e.get("_norm") and e["_norm"] == rn:
+                    target = e
+                    break
+        if target is not None:
+            target["ws_url"] = rt.ws_url
+            target["rendered"] = True
+            if sf is not None and not target.get("session_file"):
+                target["session_file"] = str(sf)
+
+    for e in info.values():
+        e.pop("_norm", None)
+    CDP_TABS_INFO.clear()
+    CDP_TABS_INFO.update(info)
+    return list(info.values())
+
+
+@app.get("/api/cdp/tabs")
+async def cdp_tabs() -> list[dict]:
+    if not vscode_cdp.cdp_available():
+        return []
+    tabs = await _build_claude_tabs()
+    out = []
+    for t in tabs:
+        sf = t.get("session_file")
+        # VS Code says this tab is "done/unread". Suppress it once the phone has
+        # seen it: you're watching it now, or nothing new arrived since you read.
+        app_done = bool(t.get("done"))
+        if app_done and sf:
+            if sf in push.ACTIVE:
+                app_done = False
+            else:
+                try:
+                    sz = os.path.getsize(sf)
+                except OSError:
+                    sz = 0
+                app_done = sz > READ_SIZE.get(sf, 0)
+        out.append({"target_id": t["id"], "title": t["title"], "rendered": t["rendered"],
+                    "window": t.get("window", ""), "done": app_done})
+    return out
+
+
+async def _ensure_rendered(uid: str) -> tuple[str | None, str | None]:
+    """Return (ws_url, session_file) for a tab, activating (rendering) it first
+    if it's a sleeping tab so CDP can attach to its webview."""
+    info = CDP_TABS_INFO.get(uid)
+    if not info:
+        await _build_claude_tabs()
+        info = CDP_TABS_INFO.get(uid)
+    if not info:
+        return None, None
+    if info.get("ws_url"):
+        return info["ws_url"], info.get("session_file")
+    # Sleeping tab: click it in VS Code to render its webview, then find it.
+    if info.get("page_ws_url") and info.get("aria"):
+        await vscode_cdp.activate_tab(info["page_ws_url"], info["aria"])
+        want_stem = uid if not uid.startswith("tab:") else None
+        aria_norm = (info.get("aria") or "").rstrip("…").strip().lower()
+        for _ in range(16):
+            await asyncio.sleep(0.5)
+            index = claude_storage.build_title_index()
+            for rt in await vscode_cdp.list_claude_tabs():
+                sf = claude_storage.match_title(rt.title, index)
+                title_match = rt.title.rstrip("…").strip().lower().startswith(aria_norm) if aria_norm else False
+                if (want_stem and sf is not None and sf.stem == want_stem) or (want_stem is None and title_match):
+                    info["ws_url"] = rt.ws_url
+                    info["rendered"] = True
+                    if sf is not None:
+                        info["session_file"] = str(sf)
+                    return rt.ws_url, info.get("session_file")
+    return None, info.get("session_file")
+
+
+@app.websocket("/ws/cdp/{target_id}")
+async def ws_cdp(ws: WebSocket, target_id: str) -> None:
+    if not auth.check(ws.query_params.get("key")):
+        await ws.close(code=4401)
+        return
+    await ws.accept()
+    from pathlib import Path as _P
+    session_file = None
+    mirror = None
+    try:
+        ws_url, session_file_str = await _ensure_rendered(target_id)
+        if not ws_url:
+            await ws.send_json({"type": "error", "text": "не удалось открыть вкладку — попробуй активировать её в VS Code"})
+            await ws.close()
+            return
+        session_file = _P(session_file_str) if session_file_str else None
+        if session_file:
+            CDP_SESSION[target_id] = str(session_file)
+            push.ACTIVE.add(str(session_file))  # suppress push while you watch this chat
+        # NOTE: we deliberately do NOT re-activate the tab here. _ensure_rendered
+        # already activates a *sleeping* tab (which clears VS Code's done icon as a
+        # side effect). A second activation raced with the just-rendered webview,
+        # disposing it → blank chats + accidental split editor groups.
+
+        # Initial history from JSONL (clean) if we know the file, else DOM fallback.
+        if session_file is not None:
+            events = jsonl_watch.read_events_from(session_file, 0)
+            await ws.send_json({"type": "history", "messages": _events_to_history(events[-60:])})
+            cu = jsonl_watch.context_usage(session_file)
+            if cu:
+                await ws.send_json({"type": "context", **cu})
+        else:
+            try:
+                tr = await vscode_cdp.read_transcript(ws_url, max_messages=30)
+                if tr.get("ok"):
+                    await ws.send_json({"type": "history", "messages": tr.get("messages", [])})
+            except Exception:
+                pass
+
+        lock = _cdp_lock(target_id)
+        # The mirror continuously reflects whatever happens in this tab — live —
+        # regardless of who started it, and survives reconnects.
+        mirror = asyncio.create_task(_mirror_loop(ws, ws_url, target_id, lock))
+
+        while True:
+            raw = await ws.receive_text()
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            kind = msg.get("type")
+
+            if kind == "send":
+                text = (msg.get("text") or "").strip()
+                images = msg.get("images") or []
+                if not text and not images:
+                    continue
+                async with lock:
+                    # Paste image attachments first (best-effort visual attach).
+                    for p in images[:MAX_FILES]:
+                        try:
+                            data = Path(p).read_bytes()
+                        except OSError:
+                            continue
+                        import base64
+                        b64 = base64.b64encode(data).decode()
+                        mime = "image/png" if p.lower().endswith(".png") else "image/jpeg"
+                        await vscode_cdp.paste_image(ws_url, b64, mime, os.path.basename(p))
+                        await asyncio.sleep(0.3)
+                    inj = await vscode_cdp.inject_and_submit(ws_url, text or "(см. вложения)", submit=True)
+                if inj.get("ok"):
+                    await ws.send_json({"type": "sent", "text": text})
+                    await ws.send_json({"type": "thinking"})
+                else:
+                    await ws.send_json({"type": "error", "text": f"inject failed: {inj.get('error')}"})
+
+            elif kind == "answer":
+                button = (msg.get("button") or "").strip()
+                if button:
+                    async with lock:
+                        res = await vscode_cdp.click_button_by_text(ws_url, button)
+                    await ws.send_json({"type": "answer_result", **res})
+                    if res.get("ok"):
+                        await ws.send_json({"type": "thinking"})
+
+            elif kind == "new_session":
+                async with lock:
+                    res = await vscode_cdp.click_new_session(ws_url)
+                await ws.send_json({"type": "new_session_result", **res})
+    except WebSocketDisconnect:
+        pass  # client left — normal, don't log a traceback
+    except Exception as e:  # noqa: BLE001
+        try:
+            await ws.send_json({"type": "error", "text": str(e)})
+        except Exception:
+            pass
+    finally:
+        if mirror:
+            mirror.cancel()
+        if session_file:
+            push.ACTIVE.discard(str(session_file))
+            try:  # mark "read up to here" so the готово mark clears on the phone
+                READ_SIZE[str(session_file)] = session_file.stat().st_size
+            except OSError:
+                pass
+
+
+def _resolve_session_file(target_id: str, title: str):
+    from pathlib import Path as _P
+    sess = CDP_SESSION.get(target_id)
+    if sess and _P(sess).exists():
+        return _P(sess)
+    f = claude_storage.find_session_file_by_title(title)
+    if f is not None:
+        CDP_SESSION[target_id] = str(f)
+    return f
+
+
+def _events_to_history(events: list[dict]) -> list[dict]:
+    """Flatten JSONL events into simple {role,text} history rows for the phone."""
+    out: list[dict] = []
+    for e in events:
+        if e["type"] == "user" and e.get("text"):
+            out.append({"role": "user", "text": e["text"]})
+        elif e["type"] == "assistant":
+            for t in e.get("tools", []):
+                out.append({"role": "tool", "text": _tool_line(t)})
+            if e.get("text"):
+                out.append({"role": "assistant", "text": e["text"]})
+        elif e["type"] == "tool_result" and e.get("text"):
+            out.append({"role": "toolout", "text": e["text"][:500]})
+    return out
+
+
+def _tool_line(t: dict) -> str:
+    name = t.get("name", "tool")
+    inp = t.get("input", {}) or {}
+    detail = ""
+    if inp.get("file_path"):
+        detail = str(inp["file_path"]).replace("\\", "/").split("/")[-1]
+    elif inp.get("command"):
+        detail = str(inp["command"])[:60]
+    elif inp.get("path"):
+        detail = str(inp["path"])
+    return f"{name}: {detail}" if detail else name
+
+
+async def _mirror_loop(ws: WebSocket, ws_url: str, target_id: str, lock) -> None:
+    """Continuously mirror the tab's live state to the phone: tail the session
+    JSONL for new events (from anyone — phone or VS Code) and surface pending
+    permission/question cards. Runs until the WebSocket disconnects."""
+    import time as _t
+    from pathlib import Path as _P
+
+    sess = CDP_SESSION.get(target_id)
+    session_file = _P(sess) if sess else None
+    pos = jsonl_watch.file_size(session_file) if session_file else None
+    seen: set[str] = set()
+    last_card_key = None
+    last_growth = _t.monotonic()
+    last_card_check = 0.0
+
+    def _key(evt: dict) -> str:
+        if evt["type"] == "assistant":
+            return "a:" + evt.get("text", "") + ",".join(
+                t.get("name", "") + str(t.get("input")) for t in evt.get("tools", []))
+        return evt["type"] + ":" + evt.get("text", "")
+
+    try:
+        while True:
+            # Discover the session file lazily if unknown (e.g. brand-new chat):
+            # pick the JSONL that grew most recently.
+            if session_file is None:
+                cand = jsonl_watch.newest_file_since(_t.time() - 30)
+                if cand is not None:
+                    session_file = cand
+                    CDP_SESSION[target_id] = str(cand)
+                    pos = 0
+
+            grew = False
+            if session_file is not None:
+                size = jsonl_watch.file_size(session_file)
+                if pos is None:
+                    pos = size
+                if size > pos:
+                    events = jsonl_watch.read_events_from(session_file, pos)
+                    pos = size
+                    grew = True
+                    last_growth = _t.monotonic()
+                    for evt in events:
+                        k = _key(evt)
+                        if k in seen:
+                            continue
+                        seen.add(k)
+                        if evt["type"] == "assistant":
+                            if not evt.get("text") and not evt.get("tools"):
+                                continue
+                            payload = {"type": "assistant", "text": evt.get("text", "")}
+                            if evt.get("tools"):
+                                payload["tools"] = evt["tools"]
+                            await ws.send_json(payload)
+                            if evt.get("stop_reason") == "end_turn":
+                                await ws.send_json({"type": "done"})
+                                cu = jsonl_watch.context_usage(session_file)
+                                if cu:
+                                    await ws.send_json({"type": "context", **cu})
+                        elif evt["type"] == "tool_result":
+                            await ws.send_json({"type": "tool_result", "text": evt.get("text", "")})
+
+            # When quiet, check for a pending interactive card (throttled).
+            quiet_for = _t.monotonic() - last_growth
+            if not grew and quiet_for >= 1.2 and (_t.monotonic() - last_card_check) >= 2.0:
+                last_card_check = _t.monotonic()
+                card = None
+                if not lock.locked():
+                    async with lock:
+                        try:
+                            card = await vscode_cdp.read_interactive(ws_url)
+                        except Exception:
+                            card = None
+                if card:
+                    ckey = card.get("prompt", "") + "|".join(o["label"] for o in card.get("options", []))
+                    if ckey != last_card_key:
+                        last_card_key = ckey
+                        await ws.send_json({"type": "interactive", "data": card})
+                else:
+                    last_card_key = None
+
+            await asyncio.sleep(0.5)
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        return
+
+
+import shutil
+import subprocess
+
+
+def _code_bin() -> str | None:
+    """Path to the REAL Microsoft VS Code — not Cursor or other forks that
+    hijack the `code` command on PATH."""
+    local = os.environ.get("LOCALAPPDATA", "")
+    progf = os.environ.get("PROGRAMFILES", "")
+    candidates = [
+        Path(local) / "Programs" / "Microsoft VS Code" / "Code.exe",
+        Path(local) / "Programs" / "Microsoft VS Code" / "bin" / "code.cmd",
+        Path(progf) / "Microsoft VS Code" / "Code.exe",
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    # Fallback to PATH only if nothing else (may be a fork like Cursor).
+    for c in ("code.cmd", "code"):
+        p = shutil.which(c)
+        if p:
+            return p
+    return None
+
+
+@app.get("/api/fs/list")
+def fs_list(path: str = Query("")) -> dict:
+    """List sub-folders for the phone's project browser. Empty path → sensible
+    roots (home, common code dirs, drives)."""
+    if not path:
+        roots = []
+        home = Path.home()
+        for cand in (home, home / "Documents", Path("C:/Creation"), Path("C:/")):
+            if cand.exists():
+                roots.append({"name": str(cand), "path": str(cand)})
+        return {"path": "", "parent": None, "dirs": roots}
+    p = Path(path)
+    if not p.is_dir():
+        raise HTTPException(400, "not a directory")
+    dirs = []
+    try:
+        for child in sorted(p.iterdir(), key=lambda c: c.name.lower()):
+            if child.is_dir() and not child.name.startswith("."):
+                dirs.append({"name": child.name, "path": str(child)})
+    except PermissionError:
+        pass
+    return {"path": str(p), "parent": str(p.parent) if p.parent != p else None, "dirs": dirs}
+
+
+class NewTabReq(BaseModel):
+    window: str
+
+
+@app.post("/api/cdp/new-tab")
+async def cdp_new_tab(req: NewTabReq) -> dict:
+    """Start a new Claude chat in a given VS Code window (project)."""
+    # Prefer a rendered tab in that window (no activation needed).
+    for info in CDP_TABS_INFO.values():
+        if info.get("window") == req.window and info.get("ws_url"):
+            return await vscode_cdp.click_new_session(info["ws_url"])
+    # Else activate any tab in that window, then start a new session.
+    for uid, info in list(CDP_TABS_INFO.items()):
+        if info.get("window") == req.window:
+            ws_url, _ = await _ensure_rendered(uid)
+            if ws_url:
+                return await vscode_cdp.click_new_session(ws_url)
+    raise HTTPException(404, "no tab in that window")
+
+
+class CloseTabReq(BaseModel):
+    target_id: str
+    others: bool = False
+
+
+@app.post("/api/cdp/close-tab")
+async def cdp_close_tab(req: CloseTabReq) -> dict:
+    """Close a Claude tab (or all others in its window) from the phone."""
+    info = CDP_TABS_INFO.get(req.target_id)
+    if not info:
+        await _build_claude_tabs()
+        info = CDP_TABS_INFO.get(req.target_id)
+    if not info or not info.get("page_ws_url"):
+        raise HTTPException(404, "tab not found")
+    page_ws = info["page_ws_url"]
+    if req.others:
+        win = info.get("window")
+        keep = info.get("panel")
+        targets = [
+            {"panel": i.get("panel"), "aria": i.get("aria")}
+            for i in CDP_TABS_INFO.values()
+            if i.get("window") == win and i.get("panel") and i.get("panel") != keep
+        ]
+    else:
+        targets = [{"panel": info.get("panel"), "aria": info.get("aria")}]
+    n = await vscode_cdp.close_tabs(page_ws, targets)
+    await _build_claude_tabs()  # refresh the cached list
+    return {"ok": n > 0, "closed": n}
+
+
+@app.get("/api/cdp/mode")
+async def cdp_get_mode(target_id: str) -> dict:
+    ws_url, _ = await _ensure_rendered(target_id)
+    if not ws_url:
+        raise HTTPException(404, "tab not rendered")
+    mode = await vscode_cdp.read_mode(ws_url)
+    return {"mode": mode, "options": vscode_cdp.MODE_LABELS}
+
+
+class SetModeReq(BaseModel):
+    target_id: str
+    mode: str
+
+
+@app.post("/api/cdp/mode")
+async def cdp_set_mode(req: SetModeReq) -> dict:
+    ws_url, _ = await _ensure_rendered(req.target_id)
+    if not ws_url:
+        raise HTTPException(404, "tab not rendered")
+    return await vscode_cdp.set_mode(ws_url, req.mode)
+
+
+@app.get("/api/cdp/models")
+async def cdp_get_models(target_id: str) -> dict:
+    ws_url, _ = await _ensure_rendered(target_id)
+    if not ws_url:
+        raise HTTPException(404, "tab not rendered")
+    return await vscode_cdp.get_models(ws_url)
+
+
+class SetModelReq(BaseModel):
+    target_id: str
+    model: str
+
+
+@app.post("/api/cdp/model")
+async def cdp_set_model(req: SetModelReq) -> dict:
+    ws_url, _ = await _ensure_rendered(req.target_id)
+    if not ws_url:
+        raise HTTPException(404, "tab not rendered")
+    return await vscode_cdp.set_model(ws_url, req.model)
+
+
+class TargetReq(BaseModel):
+    target_id: str
+
+
+@app.post("/api/cdp/thinking")
+async def cdp_toggle_thinking(req: TargetReq) -> dict:
+    ws_url, _ = await _ensure_rendered(req.target_id)
+    if not ws_url:
+        raise HTTPException(404, "tab not rendered")
+    return await vscode_cdp.toggle_thinking(ws_url)
+
+
+# ── Web Push ────────────────────────────────────────────────────────
+@app.on_event("startup")
+async def _start_push_watcher() -> None:
+    asyncio.create_task(push.watcher())
+    asyncio.create_task(_startup_online_push())
+
+
+async def _startup_online_push() -> None:
+    # After a reboot + autostart, tell the phone the PC is back. Outbound to the
+    # push service — no tunnel needed. No-op if nobody is subscribed.
+    await asyncio.sleep(6)
+    try:
+        await push.send({"title": "ClaudeBridge", "body": "ПК снова на связи ✅",
+                         "tag": "cb-online", "url": "/"})
+    except Exception:
+        pass
+
+
+@app.get("/api/push/key")
+def push_key() -> dict:
+    return {"publicKey": push.PUBLIC_KEY}
+
+
+@app.post("/api/push/subscribe")
+async def push_subscribe(request: Request) -> dict:
+    sub = await request.json()
+    push.add_subscription(sub)
+    return {"ok": True}
+
+
+@app.post("/api/push/test")
+async def push_test() -> dict:
+    n = await push.send({"title": "ClaudeBridge", "body": "Пуш работает ✅", "url": "/"})
+    return {"ok": True, "sent": n}
+
+
+@app.get("/sw.js")
+def service_worker() -> FileResponse:
+    # Served from root so its scope covers the whole app.
+    return FileResponse(WEB_DIR / "sw.js", media_type="application/javascript",
+                        headers={"Service-Worker-Allowed": "/", "Cache-Control": "no-cache"})
+
+
+@app.get("/manifest.webmanifest")
+def manifest() -> FileResponse:
+    return FileResponse(WEB_DIR / "manifest.webmanifest", media_type="application/manifest+json")
+
+
+class OpenProjectReq(BaseModel):
+    path: str
+
+
+@app.post("/api/project/open")
+def project_open(req: OpenProjectReq) -> dict:
+    """Open a folder as a VS Code project (reuses the debug-port instance)."""
+    code = _code_bin()
+    if not code:
+        raise HTTPException(500, "code CLI not found")
+    if not Path(req.path).is_dir():
+        raise HTTPException(400, "folder not found")
+    subprocess.Popen([code, str(req.path)], shell=False)
+    return {"ok": True, "path": req.path}
+
+
+class CreateProjectReq(BaseModel):
+    parent: str
+    name: str
+
+
+@app.post("/api/project/create")
+def project_create(req: CreateProjectReq) -> dict:
+    """Create a new folder and open it in VS Code."""
+    code = _code_bin()
+    if not code:
+        raise HTTPException(500, "code CLI not found")
+    parent = Path(req.parent)
+    if not parent.is_dir():
+        raise HTTPException(400, "parent not found")
+    safe = "".join(c for c in req.name if c.isalnum() or c in " ._-()").strip()
+    if not safe:
+        raise HTTPException(400, "bad name")
+    dest = parent / safe
+    dest.mkdir(parents=True, exist_ok=True)
+    subprocess.Popen([code, str(dest)], shell=False)
+    return {"ok": True, "path": str(dest)}
+
+
+@app.post("/api/upload")
+async def upload(files: list[UploadFile] = File(...)) -> dict:
+    """Receive up to 10 files from the phone, save them on the laptop, and
+    return their absolute paths so they can be referenced in a Claude message."""
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    saved: list[dict] = []
+    for f in files[:MAX_FILES]:
+        base = os.path.basename(f.filename or "file")
+        base = "".join(c for c in base if c.isalnum() or c in "._- ()")[:80] or "file"
+        dest = UPLOAD_DIR / f"{uuid.uuid4().hex[:8]}_{base}"
+        data = await f.read()
+        dest.write_bytes(data)
+        saved.append({"name": base, "path": str(dest)})
+    return {"files": saved}
+
+
+@app.get("/")
+def index() -> FileResponse:
+    return FileResponse(WEB_DIR / "index.html")
+
+
+app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
