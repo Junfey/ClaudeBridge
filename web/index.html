@@ -74,6 +74,10 @@
   .msg { padding:10px 12px; border-radius:10px; white-space:pre-wrap; word-wrap:break-word;
     overflow-wrap:anywhere; max-width:100%; }
   .msg.user { background:var(--user); align-self:flex-end; max-width:85%; }
+  .msg.user.pending { opacity:.6; }
+  .msg.user.pending::after { content:'⌛ отправляется…'; display:block; font-size:11px; color:var(--muted); margin-top:5px; }
+  .msg.user.undelivered { opacity:.75; border:1px solid var(--warn); }
+  .msg.user.undelivered::after { content:'⚠ нет связи — отправлю, как появится'; display:block; font-size:11px; color:var(--warn); margin-top:5px; }
   .msg.assistant { background:var(--panel); }
   .msg.error { color:var(--err); }
   .tool { display:flex; align-items:center; gap:8px; font-size:12px; background:rgba(91,141,239,.12);
@@ -403,7 +407,7 @@ function closeDrawer(){
   bk.style.opacity=''; bk.style.pointerEvents=''; bk.classList.remove('show');
   S.drawerOpen=false;
 }
-async function refreshDrawer(){ try{ S.cdpTabs=await api('/api/cdp/tabs'); if(S.drawerOpen) renderDrawer(); }catch(e){} }
+async function refreshDrawer(){ try{ const r=await api('/api/cdp/tabs'); S.cdpTabs=(r&&r.tabs)||[]; S.cdpOk=r?(r.cdp!==false):true; if(S.drawerOpen) renderDrawer(); }catch(e){} }
 
 // ── long-press tab menu (Close / Close others), VS Code style ──────
 function closeTabMenu(){ const m=$('tabmenu'); if(m) m.remove(); }
@@ -643,6 +647,7 @@ function connectCdpWs() {
   ws.onopen = () => {
     setStatus(true);
     stopHb();
+    flushOutbox();   // resend anything queued while we were disconnected
     S.hbTimer=setInterval(()=>{
       if(ws.readyState!==1) return;
       try{ ws.send(JSON.stringify({type:'ping'})); }catch(e){}
@@ -659,9 +664,16 @@ function connectCdpWs() {
         else if (msg.role === 'toolout') addToolResult(chat, msg.text);
         else addMsg(chat, msg.role, msg.text);
       }
+      renderOutboxPending(chat);  // show messages still queued for delivery
       scrollDown();
     } else if (m.type === 'sent') {
-      // user message already rendered locally on send — ignore echo
+      // Delivery confirmed → drop from the queue and clear the "pending" mark.
+      if (m.cid) { outboxRemove(m.cid); markBubble(m.cid, 'ok'); }
+    } else if (m.type === 'working') {
+      // Persistent liveness: keep the indicator up while Claude works, drop it
+      // when the turn ends — survives leaving/returning and reconnects.
+      if (m.on) { if (S.view==='cdpchat' && !$('thinking')) addThinking(); }
+      else removeThinking();
     } else if (m.type === 'thinking') {
       addThinking();
     } else if (m.type === 'assistant') {
@@ -685,7 +697,9 @@ function connectCdpWs() {
     } else if (m.type === 'done') {
       removeThinking(); setSending(false);
     } else if (m.type === 'error') {
-      removeThinking(); addMsg(chat, 'error', '⚠ '+(m.text||'')); setSending(false);
+      removeThinking(); setSending(false);
+      if (m.cid) markBubble(m.cid, 'undelivered');  // stays queued → retries on reconnect
+      else addMsg(chat, 'error', '⚠ '+(m.text||''));
     }
   };
   ws.onclose = () => {
@@ -889,20 +903,54 @@ function startRecog(SR){
   recog.start();
 }
 
+// ── outbox: durable send queue ─────────────────────────────────────
+// A message is kept (per-tab, in localStorage) until the server acks it. If the
+// tunnel drops mid-send, the frame is silently lost — so we resend the whole
+// queue on every (re)connect. The server dedupes by cid, so a resend of an
+// already-injected message is a no-op. This is the "cache that holds the task
+// through a connection drop until it's delivered".
+function outboxKey(){ return 'cb-outbox:'+(S.cdpTarget||''); }
+function loadOutbox(){ try{ return JSON.parse(localStorage.getItem(outboxKey())||'[]'); }catch(e){ return []; } }
+function saveOutbox(q){ try{ localStorage.setItem(outboxKey(), JSON.stringify(q)); }catch(e){} }
+function outboxAdd(it){ const q=loadOutbox(); q.push(it); saveOutbox(q); }
+function outboxRemove(cid){ saveOutbox(loadOutbox().filter(x=>x.cid!==cid)); }
+function markBubble(cid, state){
+  const el=document.querySelector('.msg.user[data-cid="'+cid+'"]'); if(!el) return;
+  el.classList.toggle('pending', state==='pending');
+  el.classList.toggle('undelivered', state==='undelivered');
+}
+function flushOutbox(){
+  if(!S.ws || S.ws.readyState!==1) return;
+  for(const it of loadOutbox()){
+    try{ S.ws.send(JSON.stringify(Object.assign({type:'send'}, it.payload, {cid:it.cid}))); markBubble(it.cid,'pending'); }catch(e){}
+  }
+}
+// Re-draw still-undelivered messages as pending bubbles when (re)entering a chat
+// (their DOM was thrown away, but the queue survived).
+function renderOutboxPending(chat){
+  for(const it of loadOutbox()){
+    if(chat.querySelector('.msg.user[data-cid="'+it.cid+'"]')) continue;
+    const t=(it.payload&&it.payload.text)||'';
+    const disp=t.startsWith('Прикреплённые файлы')?'📎 вложения':t;
+    const b=addMsg(chat,'user',disp); if(b){ b.dataset.cid=it.cid; b.classList.add('pending'); }
+  }
+}
+function newCid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,6); }
+
 // ── send (text + attachments) ──────────────────────────────────────
 sendBtn.onclick=async ()=>{
-  if(sendBtn.disabled)return;
   const text=input.value.trim();
-  if((!text && !attached.length)||!S.ws||S.ws.readyState!==1)return;
+  if(!text && !attached.length) return;
   if(recognizing) recog.stop();
-  setSending(true);
   // Keep preview URLs of image attachments to show in the chat after sending.
   const imgPreviews = attached.filter(f=>f.type.startsWith('image/')).map(f=>URL.createObjectURL(f));
   const attachedTypes = attached.map(f=>f.type);
   let paths=[];
   if(attached.length){
+    setSending(true);
     try{ paths=await uploadAttached(); }
     catch(err){ alert('Ошибка загрузки файлов: '+err.message); setSending(false); return; }
+    setSending(false);
   }
   // Images: sent both as paths-in-text (reliable — Claude reads them) and as an
   // images[] list for a best-effort visual paste into the VS Code input.
@@ -911,17 +959,36 @@ sendBtn.onclick=async ()=>{
   if(paths.length){
     finalText='Прикреплённые файлы (посмотри их):\n'+paths.join('\n')+(text?'\n\n'+text:'');
   }
-  const payload={type:'send',text:finalText};
-  if(imgPaths.length && S.view==='cdpchat') payload.images=imgPaths;
-  S.ws.send(JSON.stringify(payload));
-  input.value=''; attached=[]; renderChips();
   const chat=$('chat');
+  const queued = (S.view==='cdpchat' && S.cdpTarget);  // only cdp chats ack by cid
+  // Disk-session fallback: old direct send (that server doesn't ack by cid).
+  if(!queued){
+    if(!S.ws || S.ws.readyState!==1){ alert('Нет связи с чатом — попробуй ещё раз.'); return; }
+    S.ws.send(JSON.stringify({type:'send', text:finalText}));
+    input.value=''; attached=[]; renderChips();
+    if(chat){ if(text) addMsg(chat,'user',text); else if(paths.length) addMsg(chat,'user','📎 '+paths.length+' файл(ов)'); addImages(chat,imgPreviews); addThinking(); }
+    return;
+  }
+  const payload={text:finalText};
+  if(imgPaths.length) payload.images=imgPaths;
+  const cid=newCid();
+  // Render the bubble now, clear the input immediately — the text is safe in the
+  // queue even before it's delivered, so it can never be lost/"reset".
+  let bubble=null;
   if(chat){
-    if(text) addMsg(chat,'user',text);
-    else if(paths.length) addMsg(chat,'user','📎 '+paths.length+' файл(ов)');
+    if(text) bubble=addMsg(chat,'user',text);
+    else if(paths.length) bubble=addMsg(chat,'user','📎 '+paths.length+' файл(ов)');
+    if(bubble) bubble.dataset.cid=cid;
     addImages(chat, imgPreviews);
-    if(S.view==='cdpchat') addThinking();
-    else addThinking();
+    addThinking();
+  }
+  input.value=''; attached=[]; renderChips();
+  outboxAdd({cid, payload, ts:Date.now()});
+  if(S.ws && S.ws.readyState===1){
+    try{ S.ws.send(JSON.stringify(Object.assign({type:'send'}, payload, {cid}))); markBubble(cid,'pending'); }catch(e){ markBubble(cid,'undelivered'); }
+  } else {
+    markBubble(cid,'undelivered');
+    connectCdpWs();  // kick a reconnect → flush queue on open
   }
 };
 input.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); sendBtn.click(); } });

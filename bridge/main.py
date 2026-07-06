@@ -53,6 +53,23 @@ CDP_TABS_INFO: dict[str, dict] = {}
 # target_id -> asyncio.Lock, so inject / click / read_interactive never run
 # concurrently against the same CDP target (Electron rejects that).
 _CDP_LOCKS: dict[str, "asyncio.Lock"] = {}
+# target_id -> list of client message-ids already injected. Lets the phone
+# resend a queued message after a dropped tunnel WITHOUT double-submitting it:
+# a resend with a known cid is just re-acked, not re-injected.
+CDP_SEEN_CIDS: dict[str, list] = {}
+
+
+def _cid_is_seen(target_id: str, cid: str | None) -> bool:
+    return bool(cid) and cid in CDP_SEEN_CIDS.get(target_id, [])
+
+
+def _cid_mark(target_id: str, cid: str | None) -> None:
+    if not cid:
+        return
+    lst = CDP_SEEN_CIDS.setdefault(target_id, [])
+    lst.append(cid)
+    if len(lst) > 100:
+        del lst[0 : len(lst) - 100]
 
 
 def _cdp_lock(target_id: str) -> "asyncio.Lock":
@@ -404,6 +421,17 @@ async def ws_cdp(ws: WebSocket, target_id: str) -> None:
         except Exception:
             pass
 
+        # Tell the phone right away whether Claude is mid-turn, so re-entering a
+        # working chat shows the live indicator immediately (not only on the next
+        # event). "working" = the session file grew in the last few seconds.
+        init_working = False
+        if session_file is not None:
+            try:
+                init_working = (time.time() - session_file.stat().st_mtime) < 5
+            except OSError:
+                init_working = False
+        await ws.send_json({"type": "working", "on": init_working})
+
         lock = _cdp_lock(target_id)
         # The mirror continuously reflects whatever happens in this tab — live —
         # regardless of who started it, and survives reconnects.
@@ -420,7 +448,14 @@ async def ws_cdp(ws: WebSocket, target_id: str) -> None:
             if kind == "send":
                 text = (msg.get("text") or "").strip()
                 images = msg.get("images") or []
+                cid = msg.get("cid")
                 if not text and not images:
+                    continue
+                # Idempotent resend: if the phone already queued this cid and we
+                # injected it before (ack lost in the drop), just re-ack — never
+                # submit the same task twice.
+                if _cid_is_seen(target_id, cid):
+                    await ws.send_json({"type": "sent", "text": text, "cid": cid})
                     continue
                 async with lock:
                     # Paste image attachments first (best-effort visual attach).
@@ -436,10 +471,18 @@ async def ws_cdp(ws: WebSocket, target_id: str) -> None:
                         await asyncio.sleep(0.3)
                     inj = await vscode_cdp.inject_and_submit(ws_url, text or "(см. вложения)", submit=True)
                 if inj.get("ok"):
-                    await ws.send_json({"type": "sent", "text": text})
+                    _cid_mark(target_id, cid)  # mark delivered only after a real submit
+                    ack = {"type": "sent", "text": text}
+                    if cid:
+                        ack["cid"] = cid
+                    await ws.send_json(ack)
                     await ws.send_json({"type": "thinking"})
+                    await ws.send_json({"type": "working", "on": True})
                 else:
-                    await ws.send_json({"type": "error", "text": f"inject failed: {inj.get('error')}"})
+                    err = {"type": "error", "text": f"inject failed: {inj.get('error')}"}
+                    if cid:
+                        err["cid"] = cid  # leave it un-acked so the phone retries
+                    await ws.send_json(err)
 
             elif kind == "answer":
                 button = (msg.get("button") or "").strip()
@@ -527,8 +570,10 @@ async def _mirror_loop(ws: WebSocket, ws_url: str, target_id: str, lock) -> None
     pos = jsonl_watch.file_size(session_file) if session_file else None
     seen: set[str] = set()
     last_card_key = None
-    last_growth = _t.monotonic()
+    last_growth = 0.0        # "long ago" so an idle chat isn't reported as working
     last_card_check = 0.0
+    turn_done = False        # True once we've seen an end_turn since the last growth
+    working_sent = None      # last "working" value pushed to the phone (emit on change)
 
     def _key(evt: dict) -> str:
         if evt["type"] == "assistant":
@@ -570,12 +615,32 @@ async def _mirror_loop(ws: WebSocket, ws_url: str, target_id: str, lock) -> None
                                 payload["tools"] = evt["tools"]
                             await ws.send_json(payload)
                             if evt.get("stop_reason") == "end_turn":
+                                turn_done = True
                                 await ws.send_json({"type": "done"})
                                 cu = jsonl_watch.context_usage(session_file)
                                 if cu:
                                     await ws.send_json({"type": "context", **cu})
+                            else:
+                                turn_done = False  # still mid-turn (more coming)
                         elif evt["type"] == "tool_result":
+                            turn_done = False
                             await ws.send_json({"type": "tool_result", "text": evt.get("text", "")})
+                        elif evt["type"] == "user":
+                            turn_done = False  # a new prompt landed → working again
+
+            # Persistent "working" heartbeat: on while the file is actively
+            # growing and the turn hasn't ended; off on end_turn or after it
+            # goes quiet. Emitted only on change so the phone shows a steady
+            # "Claude работает…" that survives reconnects.
+            # end_turn (turn_done) is the authoritative "finished" signal; the long
+            # timeout is only a fallback for a missed end_turn, so the indicator
+            # doesn't wrongly clear during a slow tool run (tests, installs).
+            now_working = (session_file is not None
+                           and (_t.monotonic() - last_growth) < 45.0
+                           and not turn_done)
+            if now_working != working_sent:
+                working_sent = now_working
+                await ws.send_json({"type": "working", "on": now_working})
 
             # When quiet, check for a pending interactive card (throttled).
             quiet_for = _t.monotonic() - last_growth
