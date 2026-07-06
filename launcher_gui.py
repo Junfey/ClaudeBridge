@@ -332,11 +332,15 @@ class App:
 
     def check_vscode(self) -> None:
         if _port_open(DBG_PORT):
-            self.vscode.config(text="VS Code: отладка активна ✓", fg=OK)
+            self.vscode.config(text="VS Code: отладка активна ✓", fg=OK, cursor="")
+            self.vscode.unbind("<Button-1>")
         else:
             self.vscode.config(text="VS Code без отладки — нажми, чтобы перезапустить",
                                fg=ERR, cursor="hand2")
             self.vscode.bind("<Button-1>", lambda e: self.relaunch_vscode())
+        # Re-check periodically: VS Code may be relaunched without the flag later,
+        # which silently kills tab visibility on the phone.
+        self.root.after(15000, self.check_vscode)
 
     def relaunch_vscode(self) -> None:
         code = _find_vscode()

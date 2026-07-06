@@ -253,7 +253,9 @@ function wsKey(){ return S.key ? ('?key=' + encodeURIComponent(S.key)) : ''; }
 
 async function loadHome() {
   try {
-    S.cdpTabs = await api('/api/cdp/tabs');
+    const r = await api('/api/cdp/tabs');
+    S.cdpTabs = (r && r.tabs) || [];
+    S.cdpOk = r ? (r.cdp !== false) : true;
     setStatus(true);
     if (S.pendingOpen) {
       const t = S.cdpTabs.find(x => x.target_id === S.pendingOpen);
@@ -341,6 +343,9 @@ function tabsListHTML(){
         }).join('');
       }
     }
+  } else if (S.cdpOk === false) {
+    html += '<div class="section-label">Вкладки Claude в VS Code</div>';
+    html += '<div class="empty">⚠ VS Code запущен без отладки — мост его не видит.<br><br>В окне <b>ClaudeBridge</b> на ПК нажми «VS Code без отладки — перезапустить», затем обнови эту страницу.</div>';
   } else {
     html += '<div class="section-label">Вкладки Claude в VS Code</div>';
     html += '<div class="empty">Открытых вкладок Claude не найдено.<br>Открой чат Claude в VS Code.</div>';

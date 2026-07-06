@@ -280,9 +280,11 @@ async def _build_claude_tabs() -> list[dict]:
 
 
 @app.get("/api/cdp/tabs")
-async def cdp_tabs() -> list[dict]:
+async def cdp_tabs() -> dict:
+    # cdp=False means VS Code isn't running with the debug port — the phone can't
+    # see any tabs then, so tell it that explicitly (not "no tabs found").
     if not vscode_cdp.cdp_available():
-        return []
+        return {"cdp": False, "tabs": []}
     tabs = await _build_claude_tabs()
     out = []
     now = time.time()
@@ -310,7 +312,7 @@ async def cdp_tabs() -> list[dict]:
                 working = False
         out.append({"target_id": t["id"], "title": t["title"], "rendered": t["rendered"],
                     "window": t.get("window", ""), "done": app_done, "working": working})
-    return out
+    return {"cdp": True, "tabs": out}
 
 
 async def _ensure_rendered(uid: str) -> tuple[str | None, str | None]:
@@ -628,6 +630,27 @@ def _code_bin() -> str | None:
     return None
 
 
+def _open_folder_in_vscode(folder: str) -> None:
+    """Open a folder in VS Code. Prefer the `code` CLI (bin/code.cmd) — it opens
+    the folder in the RUNNING instance (so the debug port covers it and the tabs
+    become visible on the phone). `Code.exe <folder>` alone is unreliable."""
+    win_cli = None
+    if sys.platform.startswith("win"):
+        local = os.environ.get("LOCALAPPDATA", "")
+        progf = os.environ.get("PROGRAMFILES", "")
+        for c in (Path(local) / "Programs" / "Microsoft VS Code" / "bin" / "code.cmd",
+                  Path(progf) / "Microsoft VS Code" / "bin" / "code.cmd"):
+            if c.exists():
+                win_cli = str(c)
+                break
+        if win_cli:
+            subprocess.Popen(["cmd", "/c", win_cli, folder], shell=False)
+            return
+    code = shutil.which("code") or _code_bin()
+    if code:
+        subprocess.Popen([code, folder], shell=False)
+
+
 @app.get("/api/fs/list")
 def fs_list(path: str = Query("")) -> dict:
     """List sub-folders for the phone's project browser. Empty path → sensible
@@ -842,7 +865,7 @@ def project_open(req: OpenProjectReq) -> dict:
         raise HTTPException(500, "code CLI not found")
     if not Path(req.path).is_dir():
         raise HTTPException(400, "folder not found")
-    subprocess.Popen([code, str(req.path)], shell=False)
+    _open_folder_in_vscode(str(req.path))
     return {"ok": True, "path": req.path}
 
 
@@ -865,7 +888,7 @@ def project_create(req: CreateProjectReq) -> dict:
         raise HTTPException(400, "bad name")
     dest = parent / safe
     dest.mkdir(parents=True, exist_ok=True)
-    subprocess.Popen([code, str(dest)], shell=False)
+    _open_folder_in_vscode(str(dest))
     return {"ok": True, "path": str(dest)}
 
 
