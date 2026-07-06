@@ -248,7 +248,7 @@ async function api(path, opts) {
         statusEl.textContent = '● нужен ключ';
         statusEl.className = 'status offline';
         const k = (prompt('Ключ доступа не подошёл.\nВставь актуальный ключ из окна ClaudeBridge на ПК (или открой ссылку с ?key=…):') || '').trim();
-        if (k) { S.key = k; localStorage.setItem('bridgeKey', k); }
+        if (k) { S.key = k; localStorage.setItem('bridgeKey', k); cacheKeyForSW(); }
         return k;
       })();
     }
@@ -1148,9 +1148,17 @@ function clearBadges(){
 document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) clearBadges(); });
 window.addEventListener('focus', clearBadges);
 
+// Stash the auth key where the service worker can read it, so answering from a
+// push notification works even when the app isn't open.
+function cacheKeyForSW(){
+  try{ if('caches' in window && S.key)
+    caches.open('cb-key').then(c=>c.put('/__key', new Response(S.key))).catch(()=>{}); }catch(e){}
+}
+
 loadHome();
 autoPush();
 clearBadges();
+cacheKeyForSW();
 setInterval(()=>{ if(S.view==='home' || S.drawerOpen) loadHome(); }, 3000);
 </script>
 </body>

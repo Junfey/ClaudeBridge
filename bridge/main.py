@@ -876,11 +876,99 @@ async def cdp_set_effort(req: SetEffortReq) -> dict:
     return await vscode_cdp.set_effort(ws_url, req.index)
 
 
+class AnswerPushReq(BaseModel):
+    target_id: str
+    button: str
+
+
+@app.post("/api/cdp/answer-push")
+async def cdp_answer_push(req: AnswerPushReq) -> dict:
+    """Answer a question/permission straight from a push notification action:
+    click the option whose text matches `button` in the tab's interactive card."""
+    ws_url, _ = await _ensure_rendered(req.target_id)
+    if not ws_url:
+        raise HTTPException(404, "tab not rendered")
+    async with _cdp_lock(req.target_id):
+        return await vscode_cdp.click_button_by_text(ws_url, req.button)
+
+
 # ── Web Push ────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def _start_push_watcher() -> None:
     asyncio.create_task(push.watcher())
+    asyncio.create_task(_pending_watcher())
     asyncio.create_task(_startup_online_push())
+
+
+async def _pending_watcher() -> None:
+    """Push when a tab starts *waiting for you* — Claude asked a question or wants
+    a permission (VS Code's claude-logo-pending icon). Includes the question text
+    and, when readable, the answer options as notification action buttons so you
+    can answer straight from the notification. Baselines silently on first pass."""
+    prev_pending: set[str] = set()
+    first = True
+    while True:
+        try:
+            if vscode_cdp.cdp_available():
+                tabs = await _build_claude_tabs()
+                now_pending: set[str] = set()
+                for t in tabs:
+                    if not t.get("pending"):
+                        continue
+                    uid = t["id"]
+                    now_pending.add(uid)
+                    if uid in prev_pending or first:
+                        continue  # already notified / baseline
+                    sf = t.get("session_file")
+                    if sf and str(sf) in push.ACTIVE:
+                        continue  # you're watching this chat
+                    body = ""
+                    actions: list[dict] = []
+                    opts: dict[str, str] = {}
+                    ws_url = t.get("ws_url")
+                    if ws_url:  # rendered tab → read the actual question + options
+                        try:
+                            async with _cdp_lock(uid):
+                                card = await vscode_cdp.read_interactive(ws_url)
+                        except Exception:
+                            card = None
+                        if card:
+                            if card.get("prompt"):
+                                body = card["prompt"]
+                            labels = [o.get("label", "") for o in card.get("options", []) if o.get("label")]
+                            for i, lab in enumerate(labels[:2]):  # Chrome shows ≤2 actions
+                                aid = f"opt:{i}"
+                                actions.append({"action": aid, "title": lab[:36]})
+                                opts[aid] = lab
+                    # No permission dialog (Claude just asked in text) → use the last
+                    # assistant message as the body, so the push shows the question.
+                    if not body and sf:
+                        try:
+                            _p = Path(sf)
+                            _sz = jsonl_watch.file_size(_p)
+                            for e in jsonl_watch.read_events_from(_p, max(0, _sz - 200_000)):
+                                if e.get("type") == "assistant" and e.get("text"):
+                                    body = e["text"]
+                        except Exception:
+                            pass
+                    if not body:
+                        body = "Claude ждёт твоего ответа"
+                    payload = {
+                        "title": "❓ Claude спрашивает",
+                        "body": push.snippet(body, 150),
+                        "tag": "pending-" + uid,
+                        "url": "/?open=" + uid,
+                        "target_id": uid,
+                    }
+                    if actions:
+                        payload["actions"] = actions
+                        payload["opts"] = opts
+                    asyncio.create_task(push.send(payload))
+                prev_pending = now_pending
+                first = False
+        except Exception:
+            pass
+        await asyncio.sleep(5)
 
 
 async def _startup_online_push() -> None:

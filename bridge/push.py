@@ -68,7 +68,10 @@ def _load_or_create_vapid() -> dict:
 
 _VAPID = _load_or_create_vapid()
 PUBLIC_KEY = _VAPID["public_key"]
-_CLAIMS = {"sub": "mailto:claudebridge@localhost"}
+# VAPID subject. Apple's Web Push (Safari/iOS) REJECTS an invalid subject like
+# `mailto:...@localhost`; it requires a real mailto: or https: URL. An https URL
+# is accepted by every push service (FCM/Mozilla/Apple), so use the repo URL.
+_CLAIMS = {"sub": "https://github.com/Junfey/ClaudeBridge"}
 
 # pywebpush needs a Vapid object (a PEM *string* is misread as a raw key and
 # fails to deserialize). Build it once from the stored PEM.
@@ -145,21 +148,26 @@ async def send(payload: dict) -> int:
     return await asyncio.get_event_loop().run_in_executor(None, _send_blocking, payload)
 
 
-_COMPLETION = '"stop_reason":"end_turn"'
+import re as _re
 
 
-def _read_new(path: Path, start: int, end: int) -> str:
-    try:
-        with path.open("rb") as f:
-            f.seek(max(0, start))
-            return f.read(max(0, end - start)).decode("utf-8", errors="replace")
-    except OSError:
-        return ""
+def snippet(text: str, limit: int = 160) -> str:
+    """Turn a raw assistant/question message into a short plain-text preview for
+    a push body: drop code blocks, strip markdown marks, collapse whitespace."""
+    t = _re.sub(r"```.*?```", " […] ", text or "", flags=_re.S)
+    t = _re.sub(r"`([^`]*)`", r"\1", t)
+    t = _re.sub(r"^\s*[#>\-\*]+\s*", "", t, flags=_re.M)
+    t = _re.sub(r"[*_#`]", "", t)
+    t = _re.sub(r"\s+", " ", t).strip()
+    return (t[: limit - 1] + "…") if len(t) > limit else t
 
 
 async def watcher() -> None:
     """Watch recent session files; push once when Claude completes a turn in a
-    tab that isn't currently being mirrored. Baselines existing files silently."""
+    tab that isn't currently being mirrored. Baselines existing files silently.
+    The push body carries a preview of what Claude actually said."""
+    from . import jsonl_watch
+
     seen: dict[str, int] = {}
     first = True
     while True:
@@ -180,17 +188,29 @@ async def watcher() -> None:
                     continue
                 if key in ACTIVE:  # you're watching this chat — no push
                     continue
-                chunk = _read_new(f, prev, size)
-                if _COMPLETION in chunk:
-                    title = claude_storage._ai_title(f) or "Claude"
-                    # fire-and-forget so a slow send doesn't stall the watch loop.
-                    # url deep-links to this exact chat (target_id == session uuid).
-                    asyncio.create_task(send({
-                        "title": "Claude ответил",
-                        "body": title[:90],
-                        "tag": f.stem,
-                        "url": "/?open=" + f.stem,
-                    }))
+                try:
+                    events = jsonl_watch.read_events_from(f, prev)
+                except Exception:
+                    events = []
+                done = any(e.get("type") == "assistant" and e.get("stop_reason") == "end_turn"
+                           for e in events)
+                if not done:
+                    continue
+                # Preview = the last assistant text in this turn (fallback to title).
+                last_text = ""
+                for e in events:
+                    if e.get("type") == "assistant" and e.get("text"):
+                        last_text = e["text"]
+                title = claude_storage._ai_title(f) or "Claude"
+                body = snippet(last_text) if last_text else "Готово ✓"
+                # fire-and-forget so a slow send doesn't stall the watch loop.
+                # url deep-links to this exact chat (target_id == session uuid).
+                asyncio.create_task(send({
+                    "title": "💬 " + title[:60],
+                    "body": body,
+                    "tag": f.stem,
+                    "url": "/?open=" + f.stem,
+                }))
             first = False
         except Exception:
             pass
