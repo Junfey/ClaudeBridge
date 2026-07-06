@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "claudebridge-uploads"
 MAX_FILES = 10
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MiB per file — reject bigger, don't hang
 
 from .claude_session import ClaudeSession, new_session, resume_session
 from .claude_storage import list_sessions, load_history
@@ -284,6 +285,7 @@ async def cdp_tabs() -> list[dict]:
         return []
     tabs = await _build_claude_tabs()
     out = []
+    now = time.time()
     for t in tabs:
         sf = t.get("session_file")
         # VS Code says this tab is "done/unread". Suppress it once the phone has
@@ -298,8 +300,16 @@ async def cdp_tabs() -> list[dict]:
                 except OSError:
                     sz = 0
                 app_done = sz > READ_SIZE.get(sf, 0)
+        # "working" = the session file is actively growing (Claude is generating)
+        # and it isn't in a finished/done state.
+        working = False
+        if sf and not app_done:
+            try:
+                working = (now - os.path.getmtime(sf) < 5) and not t.get("done")
+            except OSError:
+                working = False
         out.append({"target_id": t["id"], "title": t["title"], "rendered": t["rendered"],
-                    "window": t.get("window", ""), "done": app_done})
+                    "window": t.get("window", ""), "done": app_done, "working": working})
     return out
 
 
@@ -344,6 +354,17 @@ async def ws_cdp(ws: WebSocket, target_id: str) -> None:
     session_file = None
     mirror = None
     try:
+        # Clear VS Code's "done/unread" badge when you read on the phone: activate
+        # the tab so VS Code "views" it. SAFE only for already-rendered tabs (no
+        # fresh webview to race with). Sleeping tabs are activated by
+        # _ensure_rendered below, which clears the badge the same way.
+        _info = CDP_TABS_INFO.get(target_id) or {}
+        if _info.get("done") and _info.get("ws_url") and _info.get("page_ws_url") and _info.get("aria"):
+            try:
+                await vscode_cdp.activate_tab(_info["page_ws_url"], _info["aria"])
+            except Exception:
+                pass
+
         ws_url, session_file_str = await _ensure_rendered(target_id)
         if not ws_url:
             await ws.send_json({"type": "error", "text": "не удалось открыть вкладку — попробуй активировать её в VS Code"})
@@ -372,6 +393,14 @@ async def ws_cdp(ws: WebSocket, target_id: str) -> None:
                     await ws.send_json({"type": "history", "messages": tr.get("messages", [])})
             except Exception:
                 pass
+
+        # Usage-limit banner (weekly %), if VS Code is showing one.
+        try:
+            lim = await vscode_cdp.read_limit(ws_url)
+            if lim:
+                await ws.send_json({"type": "limit", "text": lim})
+        except Exception:
+            pass
 
         lock = _cdp_lock(target_id)
         # The mirror continuously reflects whatever happens in this tab — live —
@@ -423,6 +452,9 @@ async def ws_cdp(ws: WebSocket, target_id: str) -> None:
                 async with lock:
                     res = await vscode_cdp.click_new_session(ws_url)
                 await ws.send_json({"type": "new_session_result", **res})
+
+            elif kind == "ping":
+                await ws.send_json({"type": "pong"})  # heartbeat — proves the WS is alive
     except WebSocketDisconnect:
         pass  # client left — normal, don't log a traceback
     except Exception as e:  # noqa: BLE001
@@ -502,8 +534,8 @@ async def _mirror_loop(ws: WebSocket, ws_url: str, target_id: str, lock) -> None
                 t.get("name", "") + str(t.get("input")) for t in evt.get("tools", []))
         return evt["type"] + ":" + evt.get("text", "")
 
-    try:
-        while True:
+    while True:
+        try:
             # Discover the session file lazily if unknown (e.g. brand-new chat):
             # pick the JSONL that grew most recently.
             if session_file is None:
@@ -562,11 +594,13 @@ async def _mirror_loop(ws: WebSocket, ws_url: str, target_id: str, lock) -> None
                 else:
                     last_card_key = None
 
-            await asyncio.sleep(0.5)
-    except asyncio.CancelledError:
-        return
-    except Exception:
-        return
+        except asyncio.CancelledError:
+            return
+        except (WebSocketDisconnect, RuntimeError):
+            return  # the WebSocket is gone
+        except Exception:
+            pass    # transient hiccup (JSONL/CDP) — keep mirroring, don't die
+        await asyncio.sleep(0.4)
 
 
 import shutil
@@ -723,6 +757,31 @@ async def cdp_toggle_thinking(req: TargetReq) -> dict:
     return await vscode_cdp.toggle_thinking(ws_url)
 
 
+@app.get("/api/cdp/controls")
+async def cdp_controls(target_id: str) -> dict:
+    """Current effort + thinking state for the settings sheet (fast; effort has
+    no menu, thinking opens the / menu once)."""
+    ws_url, _ = await _ensure_rendered(target_id)
+    if not ws_url:
+        raise HTTPException(404, "tab not rendered")
+    effort = await vscode_cdp.read_effort(ws_url)
+    thinking = await vscode_cdp.read_thinking(ws_url)
+    return {"effort": effort, "thinking": thinking.get("on", False)}
+
+
+class SetEffortReq(BaseModel):
+    target_id: str
+    index: int
+
+
+@app.post("/api/cdp/effort")
+async def cdp_set_effort(req: SetEffortReq) -> dict:
+    ws_url, _ = await _ensure_rendered(req.target_id)
+    if not ws_url:
+        raise HTTPException(404, "tab not rendered")
+    return await vscode_cdp.set_effort(ws_url, req.index)
+
+
 # ── Web Push ────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def _start_push_watcher() -> None:
@@ -820,8 +879,19 @@ async def upload(files: list[UploadFile] = File(...)) -> dict:
         base = os.path.basename(f.filename or "file")
         base = "".join(c for c in base if c.isalnum() or c in "._- ()")[:80] or "file"
         dest = UPLOAD_DIR / f"{uuid.uuid4().hex[:8]}_{base}"
-        data = await f.read()
-        dest.write_bytes(data)
+        # Stream to disk with a size cap so a huge file can't blow up memory / hang.
+        written = 0
+        with dest.open("wb") as out:
+            while True:
+                chunk = await f.read(1 << 20)  # 1 MiB
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_UPLOAD_BYTES:
+                    out.close()
+                    dest.unlink(missing_ok=True)
+                    raise HTTPException(413, f"файл {base} больше {MAX_UPLOAD_BYTES // (1<<20)} МБ")
+                out.write(chunk)
         saved.append({"name": base, "path": str(dest)})
     return {"files": saved}
 

@@ -1,4 +1,12 @@
-fastapi==0.118.0
-uvicorn[standard]==0.32.0
-pywin32==308
-psutil==6.1.0
+# Single source of truth for both local runs and the CI build (.github/workflows/build.yml).
+fastapi
+uvicorn[standard]
+websockets
+qrcode
+pywebpush
+cryptography
+pillow
+psutil
+pywin32; platform_system == "Windows"
+# build-only
+pyinstaller

@@ -506,14 +506,126 @@ async def set_model(ws_url: str, name: str) -> dict:
 
 
 async def toggle_thinking(ws_url: str) -> dict:
-    """Toggle the Thinking switch in the / menu."""
+    """Toggle the Thinking switch in the / menu; return the new on/off state."""
     async def fn(conn, cid):
         await _open_menu(conn, cid)
         ok = await conn.eval_in(cid, _click_cmd_js("Thinking"))
         await asyncio.sleep(0.3)
+        on = await conn.eval_in(cid, _READ_THINKING_JS)
         await conn.eval_in(cid, _ESC_JS)
-        return {"ok": bool(ok)}
+        return {"ok": bool(ok), "on": bool(on)}
     return await _with_composer(ws_url, fn) or {"ok": False}
+
+
+# Thinking toggle lives in the / menu; trackOn_0c4GDA class = enabled.
+_READ_THINKING_JS = ("(()=>{const it=[...document.querySelectorAll('.commandItem_G_S7FQ')]"
+                     ".find(x=>{const l=x.querySelector('.commandLabel_G_S7FQ');return l&&l.textContent.trim()==='Thinking';});"
+                     " if(!it)return null; return /trackOn/.test(it.innerHTML);})()")
+
+
+async def read_thinking(ws_url: str) -> dict:
+    async def fn(conn, cid):
+        await _open_menu(conn, cid)
+        on = await conn.eval_in(cid, _READ_THINKING_JS)
+        await conn.eval_in(cid, _ESC_JS)
+        return {"on": bool(on)}
+    return await _with_composer(ws_url, fn) or {"on": False}
+
+
+# Effort is a 5-notch slider (.toggle_P1HaRA) in the composer footer — no menu.
+_READ_EFFORT_JS = r"""
+(() => {
+  const tog = document.querySelector('.toggle_P1HaRA');
+  if (!tog) return '';
+  const notches = [...tog.querySelectorAll('.notch_P1HaRA')];
+  const fac = el => { const m = ((el && el.style.width || el && el.style.left) || '').match(/([0-9.]+)\s*\*\s*\(100%/); return m ? parseFloat(m[1]) : 0; };
+  const fill = tog.querySelector('.fill_P1HaRA');
+  const cur = fac(fill);
+  let idx = 0, best = 1e9;
+  notches.forEach((n, i) => { const d = Math.abs(fac(n) - cur); if (d < best) { best = d; idx = i; } });
+  return JSON.stringify({ index: idx, count: notches.length });
+})()
+"""
+
+
+def _set_effort_js(index: int) -> str:
+    # The slider reads clientX from the pointer event, so we must aim a full
+    # pointer gesture at the target notch's screen x (a plain click won't do).
+    return ("(()=>{const tog=document.querySelector('.toggle_P1HaRA'); if(!tog)return false;"
+            " const ns=[...tog.querySelectorAll('.notch_P1HaRA')]; const i=%d;"
+            " if(i<0||i>=ns.length)return false;"
+            " const nr=ns[i].getBoundingClientRect(), r=tog.getBoundingClientRect();"
+            " const x=nr.left+nr.width/2, y=r.top+r.height/2;"
+            " const o={bubbles:true,cancelable:true,view:window,clientX:x,clientY:y,pointerId:1,isPrimary:true,button:0,buttons:1};"
+            " tog.dispatchEvent(new PointerEvent('pointerdown',o));"
+            " tog.dispatchEvent(new PointerEvent('pointermove',o));"
+            " tog.dispatchEvent(new PointerEvent('pointerup',o));"
+            " tog.dispatchEvent(new MouseEvent('click',o));"
+            " return true;})()" % index)
+
+
+_READ_LIMIT_JS = ("(()=>{const b=document.querySelector('.banner_88YE4g');"
+                  " if(!b)return ''; return (b.textContent||'').replace(/View usage.*$/i,'').trim();})()")
+
+
+async def read_limit(ws_url: str) -> str:
+    """Read the 'You've used X% of your weekly limit' banner, if shown."""
+    async with websockets.connect(ws_url, max_size=30_000_000) as ws:
+        async with _CDPConn(ws) as conn:
+            await conn.call("Runtime.enable")
+            await asyncio.sleep(0.1)
+            for c in conn.collect_contexts():
+                try:
+                    r = await conn.eval_in(c["id"], _READ_LIMIT_JS)
+                except Exception:
+                    continue
+                if r:
+                    return str(r).strip()
+    return ""
+
+
+async def read_effort(ws_url: str) -> dict:
+    async with websockets.connect(ws_url, max_size=30_000_000) as ws:
+        async with _CDPConn(ws) as conn:
+            await conn.call("Runtime.enable")
+            await asyncio.sleep(0.12)
+            for c in conn.collect_contexts():
+                try:
+                    r = await conn.eval_in(c["id"], _READ_EFFORT_JS)
+                except Exception:
+                    continue
+                if r:
+                    try:
+                        return json.loads(r)
+                    except Exception:
+                        pass
+    return {"index": 0, "count": 0}
+
+
+async def set_effort(ws_url: str, index: int) -> dict:
+    async with websockets.connect(ws_url, max_size=30_000_000) as ws:
+        async with _CDPConn(ws) as conn:
+            await conn.call("Runtime.enable")
+            await asyncio.sleep(0.12)
+            ok = False
+            for c in conn.collect_contexts():
+                try:
+                    if await conn.eval_in(c["id"], _set_effort_js(index)):
+                        ok = True
+                        break
+                except Exception:
+                    continue
+            await asyncio.sleep(0.2)
+            new = {"index": index, "count": 0}
+            for c in conn.collect_contexts():
+                try:
+                    r = await conn.eval_in(c["id"], _READ_EFFORT_JS)
+                    if r:
+                        new = json.loads(r)
+                        break
+                except Exception:
+                    continue
+            return {"ok": ok, **new}
 
 
 _CLOSE_ONE_JS = r"""

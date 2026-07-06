@@ -56,6 +56,10 @@
   .card.is-done { background:rgba(217,164,65,.10); }
   .card.is-done::before { content:''; position:absolute; left:0; top:0; bottom:0; width:4px; background:var(--warn); }
   .done-badge { color:var(--warn); font-size:12px; font-weight:600; margin-left:8px; white-space:nowrap; }
+  .card.is-working { background:rgba(217,119,87,.10); }
+  .card.is-working::before { content:''; position:absolute; left:0; top:0; bottom:0; width:4px; background:var(--accent); }
+  .work-badge { color:var(--accent); font-size:12px; font-weight:600; margin-left:8px; white-space:nowrap; }
+  .spin-dot { animation:pulse 1s infinite; }
   .done-count { font-size:11px; color:#0b0d10; background:var(--warn); border-radius:10px; padding:2px 8px; font-weight:600; white-space:nowrap; }
   .card .name { overflow-wrap:anywhere; }
   .card .name { font-size:16px; font-weight:600; display:flex; align-items:center; gap:8px; }
@@ -116,6 +120,9 @@
   .lightbox img { max-width:96vw; max-height:92vh; object-fit:contain; }
   .lightbox .lb-close { position:fixed; top:14px; right:18px; color:#fff; font-size:34px; cursor:pointer; line-height:1; }
   .empty { padding:24px; color:var(--muted); text-align:center; }
+  #limitbar { display:none; padding:6px 12px; font-size:12px; background:rgba(217,164,65,.15);
+    color:var(--warn); text-align:center; border-bottom:1px solid var(--line); flex:none; }
+  #limitbar.show { display:block; }
   #drawerBack { position:fixed; inset:0; background:#000; z-index:800; opacity:0; pointer-events:none;
     transition:opacity .24s ease; }
   #drawerBack.show { opacity:.45; pointer-events:auto; }
@@ -147,6 +154,12 @@
   .install-bar button { background:var(--accent); color:#fff; border:none; border-radius:8px; padding:9px 13px; font-weight:600; cursor:pointer; white-space:nowrap; }
   .install-bar button.ib-x { background:transparent; color:var(--muted); padding:8px; font-size:18px; }
   .menu-item.sel { color:var(--accent); font-weight:600; }
+  .menu-item.nohover:active { background:transparent; }
+  .ctrl-state { color:var(--accent); font-weight:600; font-size:13px; margin-left:6px; }
+  .eff-dots { display:flex; gap:10px; margin-top:8px; align-items:center; }
+  .eff-dot { width:20px; height:20px; border-radius:50%; border:2px solid var(--line);
+    background:var(--bg); cursor:pointer; flex:none; }
+  .eff-dot.on { background:var(--accent); border-color:var(--accent); }
   .menu-item .mi-desc { color:var(--muted); font-size:12px; font-weight:400; margin-top:2px; }
   .menu-item .mi-wrap { display:flex; flex-direction:column; }
   .modebtn { background:var(--bg); border:1px solid var(--line); color:var(--fg); border-radius:8px;
@@ -164,6 +177,7 @@
   <span class="status" id="status">…</span>
 </header>
 <main id="main"></main>
+<div id="limitbar"></div>
 <div id="drawerBack"></div>
 <aside id="drawer">
   <div class="drawer-head"><span>Вкладки Claude</span></div>
@@ -209,14 +223,27 @@ let S = { view:'home', windows:[], cdpTabs:[], currentTitle:'', ws:null, key:'',
   }
 })();
 
+let _reauthing = null;
 async function api(path, opts) {
   opts = opts || {};
   opts.headers = Object.assign({}, opts.headers, { 'x-bridge-key': S.key });
   const r = await fetch(path, opts);
   if (r.status === 401) {
+    // Self-heal: the saved key is stale/wrong. Ask once (shared across concurrent
+    // 401s) for the current key from the ClaudeBridge window, then retry.
     localStorage.removeItem('bridgeKey');
-    statusEl.textContent = '● код неверный';
-    statusEl.className = 'status offline';
+    if (!_reauthing) {
+      _reauthing = (async () => {
+        statusEl.textContent = '● нужен ключ';
+        statusEl.className = 'status offline';
+        const k = (prompt('Ключ доступа не подошёл.\nВставь актуальный ключ из окна ClaudeBridge на ПК (или открой ссылку с ?key=…):') || '').trim();
+        if (k) { S.key = k; localStorage.setItem('bridgeKey', k); }
+        return k;
+      })();
+    }
+    const k = await _reauthing;
+    _reauthing = null;
+    if (k) return api(path, opts);   // retry with the new key
     throw new Error('unauthorized');
   }
   if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
@@ -274,6 +301,7 @@ function renderHome() {
   modeBtn.style.display = 'none';
   footer.classList.remove('visible');
   ctxEl.textContent='';
+  { const lb=$('limitbar'); if(lb) lb.className=''; }
   main.innerHTML = tabsListHTML();
   wireTabsList(main);
 }
@@ -299,10 +327,16 @@ function tabsListHTML(){
         html += groups[win].map(i => {
           const t = S.cdpTabs[i];
           const act = t.target_id===S.activeTab ? ' active-chat' : '';
-          const done = t.done ? ' is-done' : '';
-          return `<div class="card in-proj${act}${done}" data-cdp="${i}">
-             <div class="name"><span class="live-dot" style="background:${t.done?'var(--warn)':(t.rendered?'var(--ok)':'var(--muted)')}"></span>${esc(t.title)}${t.done?'<span class="done-badge">● готово</span>':''}</div>
-             <div class="meta">${t.done?'Claude ответил — не прочитано':(t.rendered?'активна · пишешь напрямую':'спит · откроется при заходе')}</div>
+          const state = t.working ? ' is-working' : (t.done ? ' is-done' : '');
+          const dot = t.working?'var(--accent)':(t.done?'var(--warn)':(t.rendered?'var(--ok)':'var(--muted)'));
+          const badge = t.working ? '<span class="work-badge">⟳ работает…</span>'
+                      : (t.done ? '<span class="done-badge">● готово</span>' : '');
+          const meta = t.working ? 'Claude сейчас работает'
+                     : (t.done ? 'Claude ответил — не прочитано'
+                     : (t.rendered ? 'активна · пишешь напрямую' : 'спит · откроется при заходе'));
+          return `<div class="card in-proj${act}${state}" data-cdp="${i}">
+             <div class="name"><span class="live-dot${t.working?' spin-dot':''}" style="background:${dot}"></span>${esc(t.title)}${badge}</div>
+             <div class="meta">${meta}</div>
            </div>`;
         }).join('');
       }
@@ -501,7 +535,8 @@ function showModeSheet(){
   ov.innerHTML=`<div class="menu-sheet"><div class="menu-title">Режим Claude</div>${rows}
     <div class="menu-title">Ещё</div>
     <div class="menu-item" data-act="model"><div class="mi-wrap"><div>🤖 Модель ›</div><div class="mi-desc">выбрать модель Claude</div></div></div>
-    <div class="menu-item" data-act="thinking"><div class="mi-wrap"><div>🧠 Thinking</div><div class="mi-desc">вкл / выкл размышления</div></div></div>
+    <div class="menu-item nohover"><div class="mi-wrap" style="width:100%"><div>⚡ Effort (усилие)</div><div class="eff-dots" id="effdots"><span class="mi-desc">…</span></div></div></div>
+    <div class="menu-item" data-act="thinking"><div class="mi-wrap"><div>🧠 Thinking <span id="thinkval" class="ctrl-state">…</span></div><div class="mi-desc">размышления перед ответом</div></div></div>
     ${(function(){const on=pushIsOn();return `<div class="menu-item${on?' sel':''}" data-act="push"><div class="mi-wrap"><div>🔔 Уведомления · ${on?'вкл':'выкл'}</div><div class="mi-desc">${on?'нажми, чтобы выключить':'нажми, чтобы включить (пуш когда Claude ответил)'}</div></div></div>`;})()}
     <div class="menu-item cancel" data-act="cancel">Отмена</div></div>`;
   document.body.appendChild(ov);
@@ -526,11 +561,35 @@ function showModeSheet(){
     if(act==='model'){ showModelSheet(); return; }
     if(act==='push'){ closeTabMenu(); togglePush(); return; }
     if(act==='thinking'){
-      closeTabMenu();
-      try{ await api('/api/cdp/thinking',{method:'POST',headers:{'content-type':'application/json'},
-        body:JSON.stringify({target_id:S.cdpTarget})}); }
-      catch(e){ alert('Ошибка: '+e.message); }
+      const tv=$('thinkval'); if(tv) tv.textContent='…';
+      try{ const r=await api('/api/cdp/thinking',{method:'POST',headers:{'content-type':'application/json'},
+        body:JSON.stringify({target_id:S.cdpTarget})});
+        if(tv) tv.textContent=r.on?'вкл':'выкл';
+      }catch(e){ if(tv) tv.textContent='?'; }
     }
+  });
+  loadControls();
+}
+
+// Load Effort level + Thinking state into the open settings sheet (async).
+async function loadControls(){
+  try{
+    const r=await api('/api/cdp/controls?target_id='+encodeURIComponent(S.cdpTarget));
+    renderEffortDots(r.effort||{});
+    const tv=$('thinkval'); if(tv) tv.textContent=r.thinking?'вкл':'выкл';
+  }catch(e){ const tv=$('thinkval'); if(tv) tv.textContent='?'; }
+}
+function renderEffortDots(eff){
+  const dd=$('effdots'); if(!dd) return;
+  const cnt=eff.count||0, idx=(eff.index==null?-1:eff.index);
+  if(!cnt){ dd.innerHTML='<span class="mi-desc">недоступно</span>'; return; }
+  dd.innerHTML=Array.from({length:cnt},(_,i)=>`<span class="eff-dot${i<=idx?' on':''}" data-eff="${i}"></span>`).join('');
+  dd.querySelectorAll('[data-eff]').forEach(el=>el.onclick=async(e)=>{
+    e.stopPropagation();
+    const i=+el.dataset.eff;
+    dd.querySelectorAll('.eff-dot').forEach((d,j)=>d.classList.toggle('on', j<=i));  // optimistic
+    try{ const rr=await api('/api/cdp/effort',{method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify({target_id:S.cdpTarget, index:i})}); renderEffortDots(rr); }catch(_){}
   });
 }
 
@@ -572,9 +631,22 @@ function connectCdpWs() {
   const proto = location.protocol==='https:'?'wss':'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws/cdp/${S.cdpTarget}${wsKey()}`);
   S.ws = ws;
-  ws.onopen = () => setStatus(true);
+  // Heartbeat: ping every 20s; if no pong within 8s the connection is half-dead,
+  // so force-close it → onclose reconnects. Catches silent drops the browser misses.
+  let pongTimer=null;
+  const stopHb=()=>{ if(S.hbTimer){clearInterval(S.hbTimer);S.hbTimer=null;} if(pongTimer){clearTimeout(pongTimer);pongTimer=null;} };
+  ws.onopen = () => {
+    setStatus(true);
+    stopHb();
+    S.hbTimer=setInterval(()=>{
+      if(ws.readyState!==1) return;
+      try{ ws.send(JSON.stringify({type:'ping'})); }catch(e){}
+      if(!pongTimer) pongTimer=setTimeout(()=>{ try{ ws.close(); }catch(e){} }, 8000);
+    }, 20000);
+  };
   ws.onmessage = ev => {
     const m = JSON.parse(ev.data);
+    if (m.type === 'pong') { if(pongTimer){clearTimeout(pongTimer);pongTimer=null;} return; }
     if (m.type === 'history') {
       chat.innerHTML = '';
       for (const msg of m.messages) {
@@ -597,6 +669,8 @@ function connectCdpWs() {
       if (S.view === 'cdpchat') addThinking();
     } else if (m.type === 'context') {
       ctxEl.textContent = `ctx ${m.pct}% · ${Math.round(m.tokens/1000)}k`;
+    } else if (m.type === 'limit') {
+      const lb=$('limitbar'); if(lb){ lb.textContent='⚠ '+m.text; lb.className='show'; }
     } else if (m.type === 'new_session_result') {
       // fresh chat started in VS Code — clear and reload
       chat.innerHTML=''; ctxEl.textContent='';
@@ -610,6 +684,7 @@ function connectCdpWs() {
     }
   };
   ws.onclose = () => {
+    stopHb();
     setSending(false); removeThinking();
     // Auto-reconnect while still on this chat, so the send button never dies.
     if (S.view === 'cdpchat' && S.cdpTarget) {
@@ -990,7 +1065,7 @@ window.addEventListener('focus', clearBadges);
 loadHome();
 autoPush();
 clearBadges();
-setInterval(()=>{ if(S.view==='home' || S.drawerOpen) loadHome(); }, 6000);
+setInterval(()=>{ if(S.view==='home' || S.drawerOpen) loadHome(); }, 3000);
 </script>
 </body>
 </html>
