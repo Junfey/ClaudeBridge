@@ -196,8 +196,11 @@ _TABBAR_JS = r"""
     // turn and you haven't opened that tab yet — i.e. "ready / unread". It
     // reverts when you view the tab, so this stays in sync with VS Code.
     const done = /claude-logo-done/.test(bg);
+    // claude-logo-pending.svg = Claude is waiting for you (a question / permission
+    // prompt) — the "blue dot" state. Needs your answer.
+    const pending = /claude-logo-pending/.test(bg);
     out.push({ aria, label, active: tab.classList.contains('active'),
-               index: i, claude, panelId, done });
+               index: i, claude, panelId, done, pending });
   });
   return JSON.stringify(out);
 })()

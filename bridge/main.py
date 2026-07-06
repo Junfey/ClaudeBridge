@@ -255,6 +255,7 @@ async def _build_claude_tabs() -> list[dict]:
                 "page_ws_url": wt.get("page_ws_url"), "aria": wt.get("aria") or title,
                 "window": win, "rendered": False, "_norm": _norm(title),
                 "panel": wt.get("panelId") or "", "done": bool(wt.get("done")),
+                "pending": bool(wt.get("pending")),
             })
         else:
             # No recent session file matched (old/untitled/brand-new chat). Still
@@ -268,6 +269,7 @@ async def _build_claude_tabs() -> list[dict]:
                 "page_ws_url": wt.get("page_ws_url"), "aria": wt.get("aria") or title,
                 "window": win, "rendered": False, "_norm": _norm(title),
                 "panel": wt.get("panelId") or "", "done": bool(wt.get("done")),
+                "pending": bool(wt.get("pending")),
             })
 
     # 2. Rendered webviews → attach ws_url (enables inject/mirror immediately).
@@ -319,16 +321,20 @@ async def cdp_tabs() -> dict:
                 except OSError:
                     sz = 0
                 app_done = sz > READ_SIZE.get(sf, 0)
+        # "pending" = Claude is waiting for you (question / permission). Takes
+        # priority over working/done — it needs an answer.
+        pending = bool(t.get("pending"))
         # "working" = the session file is actively growing (Claude is generating)
-        # and it isn't in a finished/done state.
+        # and it isn't in a finished/done/waiting state.
         working = False
-        if sf and not app_done:
+        if sf and not app_done and not pending:
             try:
                 working = (now - os.path.getmtime(sf) < 5) and not t.get("done")
             except OSError:
                 working = False
         out.append({"target_id": t["id"], "title": t["title"], "rendered": t["rendered"],
-                    "window": t.get("window", ""), "done": app_done, "working": working})
+                    "window": t.get("window", ""), "done": app_done,
+                    "working": working, "pending": pending})
     return {"cdp": True, "tabs": out}
 
 

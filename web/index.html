@@ -59,8 +59,12 @@
   .card.is-working { background:rgba(217,119,87,.10); }
   .card.is-working::before { content:''; position:absolute; left:0; top:0; bottom:0; width:4px; background:var(--accent); }
   .work-badge { color:var(--accent); font-size:12px; font-weight:600; margin-left:8px; white-space:nowrap; }
+  .card.is-pending { background:rgba(91,141,239,.13); }
+  .card.is-pending::before { content:''; position:absolute; left:0; top:0; bottom:0; width:4px; background:var(--tool); }
+  .pending-badge { color:var(--tool); font-size:12px; font-weight:600; margin-left:8px; white-space:nowrap; }
   .spin-dot { animation:pulse 1s infinite; }
   .done-count { font-size:11px; color:#0b0d10; background:var(--warn); border-radius:10px; padding:2px 8px; font-weight:600; white-space:nowrap; }
+  .pending-count { font-size:11px; color:#fff; background:var(--tool); border-radius:10px; padding:2px 8px; font-weight:600; white-space:nowrap; }
   .card .name { overflow-wrap:anywhere; }
   .card .name { font-size:16px; font-weight:600; display:flex; align-items:center; gap:8px; }
   .card .meta { color:var(--muted); font-size:13px; margin-top:4px; word-break:break-all; }
@@ -86,6 +90,9 @@
   .toolout { font-size:11px; color:var(--muted); background:rgba(255,255,255,.03); padding:6px 10px;
     border-radius:6px; font-family:ui-monospace,monospace; white-space:pre-wrap; word-break:break-all;
     max-height:140px; overflow:hidden; border-left:2px solid var(--line); }
+  .chat-loading { padding:34px 14px; color:var(--muted); text-align:center; display:flex;
+    align-items:center; justify-content:center; gap:10px; font-size:14px; }
+  .chat-loading .spin { width:18px; height:18px; margin:0; }
   .thinking { padding:8px 4px; color:var(--muted); font-style:italic; display:flex; align-items:center; gap:8px; }
   .thinking .dot { width:8px; height:8px; background:var(--accent); border-radius:50%; animation:pulse 1.2s infinite; }
   @keyframes pulse { 0%,100%{opacity:.3} 50%{opacity:1} }
@@ -322,9 +329,11 @@ function tabsListHTML(){
     for (const win of Object.keys(groups)) {
       const isCol = !!S.collapsed[win];
       const doneN = groups[win].filter(i => S.cdpTabs[i].done).length;
+      const pendN = groups[win].filter(i => S.cdpTabs[i].pending).length;
       html += `<div class="proj-head" data-proj="${esc(win)}">
                  <span class="chev">${isCol?'▶':'▼'}</span>
                  <span class="proj-name">${esc(win)}</span>
+                 ${pendN?`<span class="pending-count">${pendN} ❓</span>`:''}
                  ${doneN?`<span class="done-count">${doneN} готово</span>`:''}
                  <span class="proj-count">${groups[win].length}</span>
                </div>`;
@@ -333,15 +342,17 @@ function tabsListHTML(){
         html += groups[win].map(i => {
           const t = S.cdpTabs[i];
           const act = t.target_id===S.activeTab ? ' active-chat' : '';
-          const state = t.working ? ' is-working' : (t.done ? ' is-done' : '');
-          const dot = t.working?'var(--accent)':(t.done?'var(--warn)':(t.rendered?'var(--ok)':'var(--muted)'));
-          const badge = t.working ? '<span class="work-badge">⟳ работает…</span>'
-                      : (t.done ? '<span class="done-badge">● готово</span>' : '');
-          const meta = t.working ? 'Claude сейчас работает'
+          const state = t.pending ? ' is-pending' : (t.working ? ' is-working' : (t.done ? ' is-done' : ''));
+          const dot = t.pending?'var(--tool)':(t.working?'var(--accent)':(t.done?'var(--warn)':(t.rendered?'var(--ok)':'var(--muted)')));
+          const badge = t.pending ? '<span class="pending-badge">❓ ждёт ответа</span>'
+                      : (t.working ? '<span class="work-badge">⟳ работает…</span>'
+                      : (t.done ? '<span class="done-badge">● готово</span>' : ''));
+          const meta = t.pending ? 'Claude задал вопрос — открой и ответь'
+                     : (t.working ? 'Claude сейчас работает'
                      : (t.done ? 'Claude ответил — не прочитано'
-                     : (t.rendered ? 'активна · пишешь напрямую' : 'спит · откроется при заходе'));
+                     : (t.rendered ? 'активна · пишешь напрямую' : 'спит · откроется при заходе')));
           return `<div class="card in-proj${act}${state}" data-cdp="${i}">
-             <div class="name"><span class="live-dot${t.working?' spin-dot':''}" style="background:${dot}"></span>${esc(t.title)}${badge}</div>
+             <div class="name"><span class="live-dot${(t.working||t.pending)?' spin-dot':''}" style="background:${dot}"></span>${esc(t.title)}${badge}</div>
              <div class="meta">${meta}</div>
            </div>`;
         }).join('');
@@ -504,7 +515,9 @@ function openCdpTab(tab) {
   backBtn.onclick = () => openDrawer();   // ← opens the tabs menu over the chat
   footer.classList.add('visible');
   ctxEl.textContent='';
-  main.innerHTML = '<div class="chat" id="chat"></div>';
+  // Show a loading spinner right away — activating a sleeping tab + fetching
+  // history can take several seconds, and a blank black screen looks broken.
+  main.innerHTML = '<div class="chat" id="chat"><div class="chat-loading" id="chatloading"><span class="spin"></span>загружаю чат…</div></div>';
 
   S.cdpTarget = tab.target_id;
   S.activeTab = tab.target_id;   // persists after going back → shows the bar + enables forward-swipe
@@ -657,6 +670,7 @@ function connectCdpWs() {
   ws.onmessage = ev => {
     const m = JSON.parse(ev.data);
     if (m.type === 'pong') { if(pongTimer){clearTimeout(pongTimer);pongTimer=null;} return; }
+    { const cl=$('chatloading'); if(cl) cl.remove(); }  // first real message → drop the loader
     if (m.type === 'history') {
       chat.innerHTML = '';
       for (const msg of m.messages) {
