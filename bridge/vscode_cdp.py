@@ -403,7 +403,19 @@ _CLICK_SWITCH_JS = ("(()=>{const it=[...document.querySelectorAll('.commandItem_
                     "return t.indexOf('Switch model')===0&&t.indexOf('Switch models')!==0;});"
                     " if(!it)return false; ['mousedown','mouseup','click'].forEach(t=>"
                     "it.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window}))); return true;})()")
-_LIST_MODELS_JS = "(()=>JSON.stringify([...document.querySelectorAll('.modelLabel_G8AMvA')].map(s=>s.textContent.trim())))()"
+# Each model row shows a short label (Opus/Sonnet/…) plus a fuller line with the
+# version + blurb ("Opus 4.8 with 1M context · Best for…"). Return both so the
+# phone can show the actual version, not just "Opus".
+_LIST_MODELS_JS = (
+    "(()=>JSON.stringify([...document.querySelectorAll('.modelLabel_G8AMvA')].map(s=>{"
+    " const label=s.textContent.trim();"
+    " const item=s.closest('.commandItem_G_S7FQ')||s.parentElement;"
+    " let full=(item?item.textContent:'').trim();"
+    " if(full.indexOf(label)===0) full=full.slice(label.length).trim();"
+    " const detail=(full.split('\\u00b7')[0]||'').trim();"  # text before the "·"
+    " return {label:label, detail:detail};"
+    "})))()"
+)
 
 
 def _click_model_js(name: str) -> str:
@@ -546,19 +558,28 @@ _READ_EFFORT_JS = r"""
   const cur = fac(fill);
   let idx = 0, best = 1e9;
   notches.forEach((n, i) => { const d = Math.abs(fac(n) - cur); if (d < best) { best = d; idx = i; } });
-  return JSON.stringify({ index: idx, count: notches.length });
+  // Level name from the menu item: "Effort(High)" -> "High".
+  let label = '';
+  const l = [...document.querySelectorAll('.commandLabel_G_S7FQ')].find(e => e.textContent.trim().indexOf('Effort') === 0);
+  if (l) { const m = l.textContent.match(/\(([^)]+)\)/); if (m) label = m[1].trim(); }
+  return JSON.stringify({ index: idx, count: notches.length, label: label });
 })()
 """
 
 
 def _set_effort_js(index: int) -> str:
-    # The slider reads clientX from the pointer event, so we must aim a full
-    # pointer gesture at the target notch's screen x (a plain click won't do).
+    # The slider reads clientX from the pointer event, so we aim a full pointer
+    # gesture at the target notch's screen x. The FIRST and LAST notches sit a
+    # half-thumb inside the track edge, so aiming at their centre lands a notch
+    # short (0→1, last→last-1). For the endpoints, overshoot to the track edge so
+    # the value clamps to the true min/max; middle notches use their centre.
     return ("(()=>{const tog=document.querySelector('.toggle_P1HaRA'); if(!tog)return false;"
             " const ns=[...tog.querySelectorAll('.notch_P1HaRA')]; const i=%d;"
             " if(i<0||i>=ns.length)return false;"
-            " const nr=ns[i].getBoundingClientRect(), r=tog.getBoundingClientRect();"
-            " const x=nr.left+nr.width/2, y=r.top+r.height/2;"
+            " const r=tog.getBoundingClientRect(), nr=ns[i].getBoundingClientRect();"
+            " let x=nr.left+nr.width/2;"
+            " if(i===0) x=r.left+1; else if(i===ns.length-1) x=r.right-1;"
+            " const y=r.top+r.height/2;"
             " const o={bubbles:true,cancelable:true,view:window,clientX:x,clientY:y,pointerId:1,isPrimary:true,button:0,buttons:1};"
             " tog.dispatchEvent(new PointerEvent('pointerdown',o));"
             " tog.dispatchEvent(new PointerEvent('pointermove',o));"

@@ -572,7 +572,7 @@ function showModeSheet(){
   ov.innerHTML=`<div class="menu-sheet"><div class="menu-title">Режим Claude</div>${rows}
     <div class="menu-title">Ещё</div>
     <div class="menu-item" data-act="model"><div class="mi-wrap"><div>🤖 Модель ›</div><div class="mi-desc">выбрать модель Claude</div></div></div>
-    <div class="menu-item nohover"><div class="mi-wrap" style="width:100%"><div>⚡ Effort (усилие)</div><div class="eff-dots" id="effdots"><span class="mi-desc">…</span></div></div></div>
+    <div class="menu-item nohover"><div class="mi-wrap" style="width:100%"><div>⚡ Effort (усилие) <span id="effname" class="ctrl-state"></span></div><div class="eff-dots" id="effdots"><span class="mi-desc">…</span></div></div></div>
     <div class="menu-item" data-act="thinking"><div class="mi-wrap"><div>🧠 Thinking <span id="thinkval" class="ctrl-state">…</span></div><div class="mi-desc">размышления перед ответом</div></div></div>
     ${(function(){const on=pushIsOn();return `<div class="menu-item${on?' sel':''}" data-act="push"><div class="mi-wrap"><div>🔔 Уведомления · ${on?'вкл':'выкл'}</div><div class="mi-desc">${on?'нажми, чтобы выключить':'нажми, чтобы включить (пуш когда Claude ответил)'}</div></div></div>`;})()}
     <div class="menu-item cancel" data-act="cancel">Отмена</div></div>`;
@@ -616,9 +616,21 @@ async function loadControls(){
     const tv=$('thinkval'); if(tv) tv.textContent=r.thinking?'вкл':'выкл';
   }catch(e){ const tv=$('thinkval'); if(tv) tv.textContent='?'; }
 }
+// Russian name for an effort level (by VS Code's English label, else by index).
+function effortRu(label, idx){
+  const l=(label||'').toLowerCase();
+  if(l.indexOf('low')===0) return 'Низкий';
+  if(l.indexOf('medium')===0) return 'Средний';
+  if(l.indexOf('extra')===0) return 'Очень высокий';
+  if(l.indexOf('high')===0) return 'Высокий';
+  if(l.indexOf('max')===0) return 'Максимальный';
+  if(l.indexOf('ultra')===0) return 'Ультракод';
+  return ['Низкий','Средний','Высокий','Очень высокий','Максимальный','Ультракод'][idx] || label || '';
+}
 function renderEffortDots(eff){
   const dd=$('effdots'); if(!dd) return;
   const cnt=eff.count||0, idx=(eff.index==null?-1:eff.index);
+  const nm=$('effname'); if(nm) nm.textContent = (cnt && idx>=0) ? effortRu(eff.label, idx) : '';
   if(!cnt){ dd.innerHTML='<span class="mi-desc">недоступно</span>'; return; }
   dd.innerHTML=Array.from({length:cnt},(_,i)=>`<span class="eff-dot${i<=idx?' on':''}" data-eff="${i}"></span>`).join('');
   dd.querySelectorAll('[data-eff]').forEach(el=>el.onclick=async(e)=>{
@@ -644,8 +656,11 @@ async function showModelSheet(){
   catch(e){ sheet.innerHTML=`<div class="menu-title">Ошибка</div><div class="menu-item">${esc(e.message)}</div><div class="menu-item cancel" data-x="1">Закрыть</div>`; sheet.querySelector('[data-x]').onclick=()=>closeTabMenu(); return; }
   const cur=data.current||'';
   const rows=(data.options||[]).map(o=>{
-    const sel=o===cur?' sel':'';
-    return `<div class="menu-item${sel}" data-model="${esc(o)}"><div class="mi-wrap"><div>${sel?'● ':''}${esc(o)}</div></div></div>`;
+    // options are {label, detail} — label = short name, detail = version + blurb
+    const label=(o&&o.label!==undefined)?o.label:o;
+    const detail=(o&&o.detail)?o.detail:'';
+    const sel=label===cur?' sel':'';
+    return `<div class="menu-item${sel}" data-model="${esc(label)}"><div class="mi-wrap"><div>${sel?'● ':''}${esc(label)}</div>${detail?`<div class="mi-desc">${esc(detail)}</div>`:''}</div></div>`;
   }).join('');
   sheet.innerHTML=`<div class="menu-title">Модель Claude${cur?' · сейчас '+esc(cur):''}</div>${rows}
     <div class="menu-item cancel" data-model="">Отмена</div>`;
