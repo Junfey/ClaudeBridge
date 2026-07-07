@@ -354,12 +354,19 @@ async def _ensure_rendered(uid: str) -> tuple[str | None, str | None]:
         await vscode_cdp.activate_tab(info["page_ws_url"], info["aria"])
         want_stem = uid if not uid.startswith("tab:") else None
         aria_norm = (info.get("aria") or "").rstrip("…").strip().lower()
-        for _ in range(16):
-            await asyncio.sleep(0.5)
+        # A brand-new chat: the tab bar labels it "Claude Code" but its rendered
+        # webview title is "Untitled" — so title-prefix matching never hits and we
+        # used to poll for the full ~30s. Match those fresh titles explicitly.
+        fresh = aria_norm in ("claude code", "(новый чат)", "новый чат", "")
+        for _ in range(12):
+            await asyncio.sleep(0.4)
             index = claude_storage.build_title_index()
             for rt in await vscode_cdp.list_claude_tabs():
                 sf = claude_storage.match_title(rt.title, index)
-                title_match = rt.title.rstrip("…").strip().lower().startswith(aria_norm) if aria_norm else False
+                tnorm = rt.title.rstrip("…").strip().lower()
+                title_match = bool(aria_norm) and tnorm.startswith(aria_norm)
+                if fresh and tnorm in ("untitled", "claude code", "(новый чат)"):
+                    title_match = True
                 if (want_stem and sf is not None and sf.stem == want_stem) or (want_stem is None and title_match):
                     info["ws_url"] = rt.ws_url
                     info["rendered"] = True
@@ -390,9 +397,15 @@ async def ws_cdp(ws: WebSocket, target_id: str) -> None:
             except Exception:
                 pass
 
-        ws_url, session_file_str = await _ensure_rendered(target_id)
+        # Bounded so a hard-to-attach tab can NEVER hang the handshake (the phone
+        # would show its loader forever).
+        try:
+            ws_url, session_file_str = await asyncio.wait_for(_ensure_rendered(target_id), timeout=12)
+        except asyncio.TimeoutError:
+            ws_url, session_file_str = None, None
         if not ws_url:
-            await ws.send_json({"type": "error", "text": "не удалось открыть вкладку — попробуй активировать её в VS Code"})
+            await ws.send_json({"type": "history", "messages": []})  # clear the loader
+            await ws.send_json({"type": "error", "text": "Не удалось открыть вкладку — открой её в VS Code и зайди снова."})
             await ws.close()
             return
         session_file = _P(session_file_str) if session_file_str else None
@@ -412,16 +425,22 @@ async def ws_cdp(ws: WebSocket, target_id: str) -> None:
             if cu:
                 await ws.send_json({"type": "context", **cu})
         else:
+            # New/unmatched tab (no JSONL yet). Always send a history — even an
+            # empty one — so the phone's "загружаю чат…" loader clears instead of
+            # spinning forever on a brand-new tab.
+            msgs = []
             try:
-                tr = await vscode_cdp.read_transcript(ws_url, max_messages=30)
+                tr = await asyncio.wait_for(
+                    vscode_cdp.read_transcript(ws_url, max_messages=30), timeout=8)
                 if tr.get("ok"):
-                    await ws.send_json({"type": "history", "messages": tr.get("messages", [])})
+                    msgs = tr.get("messages", [])
             except Exception:
                 pass
+            await ws.send_json({"type": "history", "messages": msgs})
 
         # Usage-limit banner (weekly %), if VS Code is showing one.
         try:
-            lim = await vscode_cdp.read_limit(ws_url)
+            lim = await asyncio.wait_for(vscode_cdp.read_limit(ws_url), timeout=6)
             if lim:
                 await ws.send_json({"type": "limit", "text": lim})
         except Exception:
@@ -623,6 +642,10 @@ async def _mirror_loop(ws: WebSocket, ws_url: str, target_id: str, lock) -> None
     sess = CDP_SESSION.get(target_id)
     session_file = _P(sess) if sess else None
     pos = jsonl_watch.file_size(session_file) if session_file else None
+    # For a brand-new tab (no session file yet) remember current file sizes, so we
+    # can later latch onto the chat the user starts HERE — not replay an unrelated
+    # session that just happens to be active elsewhere.
+    baseline = jsonl_watch.snapshot_sizes() if session_file is None else {}
     seen: set[str] = set()
     last_card_key = None
     last_growth = 0.0        # "long ago" so an idle chat isn't reported as working
@@ -640,14 +663,30 @@ async def _mirror_loop(ws: WebSocket, ws_url: str, target_id: str, lock) -> None
 
     while True:
         try:
-            # Discover the session file lazily if unknown (e.g. brand-new chat):
-            # pick the JSONL that grew most recently.
+            # Discover the session file lazily for a brand-new tab: prefer a file
+            # that APPEARED since we started (a fresh chat writes a new JSONL on
+            # the first message), else one that grew past its baseline — reading
+            # only the new part. Never replays an unrelated already-active chat.
             if session_file is None:
-                cand = jsonl_watch.newest_file_since(_t.time() - 30)
-                if cand is not None:
-                    session_file = cand
-                    CDP_SESSION[target_id] = str(cand)
-                    pos = 0
+                newf = grown = None
+                for f in jsonl_watch._all_session_files():
+                    fp = str(f)
+                    try:
+                        sz = f.stat().st_size
+                    except OSError:
+                        continue
+                    base = baseline.get(fp)
+                    if base is None:
+                        if sz > 0:
+                            newf = (f, 0)
+                            break
+                    elif sz > base and grown is None:
+                        grown = (f, base)
+                pick = newf or grown
+                if pick:
+                    session_file = pick[0]
+                    CDP_SESSION[target_id] = str(pick[0])
+                    pos = pick[1]
 
             grew = False
             if session_file is not None:
