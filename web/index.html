@@ -550,6 +550,7 @@ function openCdpTab(tab) {
   // history can take several seconds, and a blank black screen looks broken.
   main.innerHTML = '<div class="chat" id="chat"><div class="chat-loading" id="chatloading"><span class="spin"></span>загружаю чат…</div></div>';
   _stick = true;   // a freshly opened chat follows new messages
+  S.lastAction = '';
 
   S.cdpTarget = tab.target_id;
   S.card=null; S.cardKey='';     // reset any pending-question card from another chat
@@ -748,11 +749,12 @@ function connectCdpWs() {
       addThinking();
     } else if (m.type === 'assistant') {
       removeThinking();
-      if (m.tools) for (const t of m.tools) addTool(chat, t);
+      if (m.tools && m.tools.length){ for (const t of m.tools) addTool(chat, t); S.lastAction = toolLabel(m.tools[m.tools.length-1]); }
       if (m.text) addMsg(chat, 'assistant', m.text);
       if (S.view === 'cdpchat') addThinking();
     } else if (m.type === 'tool_result') {
       addToolResult(chat, m.text);
+      S.lastAction = '';   // tool done → Claude thinks next
       if (S.view === 'cdpchat') addThinking();
     } else if (m.type === 'context') {
       ctxEl.textContent = `ctx ${m.pct}% · ${Math.round(m.tokens/1000)}k`;
@@ -781,7 +783,7 @@ function connectCdpWs() {
         else { document.querySelectorAll('.icard.answering').forEach(e=>e.classList.remove('answering')); }
       }
     } else if (m.type === 'done') {
-      removeThinking(); setSending(false);
+      removeThinking(); setSending(false); S.lastAction='';
     } else if (m.type === 'error') {
       removeThinking(); setSending(false);
       if (m.cid) markBubble(m.cid, 'undelivered');  // stays queued → retries on reconnect
@@ -803,16 +805,22 @@ function connectCdpWs() {
   };
 }
 
-function addTool(chat, t) {
-  const el = document.createElement('div');
-  el.className = 'tool';
+function toolLabel(t){
   const name = t.name || 'tool';
   let detail = '';
   const inp = t.input || {};
   if (inp.file_path) detail = inp.file_path.split(/[\\/]/).pop();
-  else if (inp.command) detail = inp.command.slice(0,50);
-  else if (inp.path) detail = inp.path;
-  el.textContent = `${iconFor(name)} ${name}${detail?' · '+detail:''}`;
+  else if (inp.command) detail = inp.command.slice(0,44);
+  else if (inp.path) detail = inp.path.split(/[\\/]/).pop();
+  else if (inp.pattern) detail = inp.pattern.slice(0,44);
+  else if (inp.url) detail = inp.url.replace(/^https?:\/\//,'').slice(0,44);
+  else if (inp.query) detail = inp.query.slice(0,44);
+  return `${iconFor(name)} ${name}${detail?' · '+detail:''}`;
+}
+function addTool(chat, t) {
+  const el = document.createElement('div');
+  el.className = 'tool';
+  el.textContent = toolLabel(t);
   chat.appendChild(el); scrollDown();
 }
 function addToolResult(chat, text){
@@ -1016,7 +1024,10 @@ function addMsg(chat,role,text){
 }
 function addThinking(){ removeThinking(); const chat=$('chat'); if(!chat)return;
   const el=document.createElement('div'); el.className='thinking'; el.id='thinking';
-  el.innerHTML='<span class="dot"></span>Claude думает…'; chat.appendChild(el); scrollDown(); }
+  // Show the CONCRETE current action (the running tool) when we know it, not just
+  // a generic "думает" — so the phone mirrors what VS Code shows Claude doing.
+  el.innerHTML='<span class="dot"></span>'+(S.lastAction ? esc(S.lastAction) : 'Claude работает…');
+  chat.appendChild(el); scrollDown(); }
 function removeThinking(){ const t=$('thinking'); if(t)t.remove(); }
 function setSending(on){ sendBtn.disabled=on; sendBtn.textContent=on?'…':'▶'; }
 // Sticky auto-scroll: follow new messages ONLY while the user is already near
@@ -1145,6 +1156,7 @@ function newCid(){ return Date.now().toString(36)+Math.random().toString(36).sli
 // ── send (text + attachments) ──────────────────────────────────────
 sendBtn.onclick=async ()=>{
   _stick = true;   // when you send, follow the conversation to the end
+  S.lastAction = '';   // new turn — reset the "current action" label
   const text=input.value.trim();
   if(!text && !attached.length) return;
   if(recognizing) recog.stop();

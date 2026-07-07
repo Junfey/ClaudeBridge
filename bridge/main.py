@@ -457,12 +457,13 @@ async def ws_cdp(ws: WebSocket, target_id: str) -> None:
             pass
 
         # Tell the phone right away whether Claude is mid-turn, so re-entering a
-        # working chat shows the live indicator immediately (not only on the next
-        # event). "working" = the session file grew in the last few seconds.
+        # working chat (e.g. from the tabs menu) shows the live indicator at once
+        # instead of a blank. 45s window (matches the mirror) so a long thinking/
+        # tool phase — where the JSONL is quiet for a bit — still reads as working.
         init_working = False
         if session_file is not None:
             try:
-                init_working = (time.time() - session_file.stat().st_mtime) < 5
+                init_working = (time.time() - await _off(os.path.getmtime, str(session_file))) < 45
             except OSError:
                 init_working = False
         await ws.send_json({"type": "working", "on": init_working})
