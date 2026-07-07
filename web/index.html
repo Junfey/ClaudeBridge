@@ -541,6 +541,7 @@ function openCdpTab(tab) {
   main.innerHTML = '<div class="chat" id="chat"><div class="chat-loading" id="chatloading"><span class="spin"></span>загружаю чат…</div></div>';
 
   S.cdpTarget = tab.target_id;
+  S.card=null; S.cardKey='';     // reset any pending-question card from another chat
   S.activeTab = tab.target_id;   // persists after going back → shows the bar + enables forward-swipe
   // optimistically clear the "готово/unread" mark — the server confirms on next poll
   const tt = S.cdpTabs.find(x => x.target_id===tab.target_id); if(tt) tt.done=false;
@@ -715,6 +716,7 @@ function connectCdpWs() {
         else addMsg(chat, msg.role, msg.text);
       }
       renderOutboxPending(chat);  // show messages still queued for delivery
+      if (S.card) addInteractive(chat, S.card);  // restore a still-pending question card
       scrollDown();
     } else if (m.type === 'sent') {
       // Delivery confirmed → drop from the queue and clear the "pending" mark.
@@ -740,10 +742,18 @@ function connectCdpWs() {
       const lb=$('limitbar'); if(lb){ lb.textContent='⚠ '+m.text; lb.className='show'; }
     } else if (m.type === 'new_session_result') {
       // fresh chat started in VS Code — clear and reload
-      chat.innerHTML=''; ctxEl.textContent='';
+      chat.innerHTML=''; ctxEl.textContent=''; S.card=null; S.cardKey=''; removeInteractive();
     } else if (m.type === 'interactive') {
-      removeThinking(); setSending(false);
-      addInteractive(chat, m.data);
+      // Singleton card: dedupe so re-sends (e.g. after a reconnect) don't blink
+      // it, and remove it on an explicit null (question answered / gone).
+      if (!m.data) { removeInteractive(); S.card=null; S.cardKey=''; }
+      else {
+        const key = cardKeyOf(m.data);
+        if (!(S.cardKey===key && document.querySelector('.icard'))) {
+          removeInteractive(); S.card=m.data; S.cardKey=key;
+          removeThinking(); setSending(false); addInteractive(chat, m.data);
+        }
+      }
     } else if (m.type === 'done') {
       removeThinking(); setSending(false);
     } else if (m.type === 'error') {
@@ -787,12 +797,20 @@ function iconFor(name){ const n=name.toLowerCase();
   if(n.includes('read'))return '📖'; if(n.includes('edit')||n.includes('write'))return '✏️';
   if(n.includes('bash'))return '$'; if(n.includes('grep')||n.includes('glob'))return '🔍'; return '🔧'; }
 
+// A stable identity for a card so re-sends can be deduped (no flicker).
+function cardKeyOf(d){ if(!d) return '';
+  return (d.title||'')+'|'+((d.options||[]).map(o=>o.label).join('~'))
+    +'|'+((d.questions||[]).map(q=>q.question+':'+(q.options||[]).map(o=>o.label).join(',')).join('~')); }
+function removeInteractive(){ document.querySelectorAll('.icard').forEach(e=>e.remove()); }
+
 function addInteractive(chat, data) {
+  removeInteractive();  // never stack cards — one at a time
   const el = document.createElement('div');
   const perm = data.kind === 'permission';
   el.className = 'icard' + (perm?' perm':'');
   const send = (label, isQ) => {
     if (S.ws && S.ws.readyState===1) S.ws.send(JSON.stringify({type:'answer', button:label, question:!!isQ}));
+    S.card=null; S.cardKey='';  // answered → forget it (don't restore on reconnect)
     el.remove(); addThinking();
   };
   // Clarifying question(s): render every question with all its options AND

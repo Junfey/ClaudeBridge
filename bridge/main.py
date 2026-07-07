@@ -437,6 +437,9 @@ async def ws_cdp(ws: WebSocket, target_id: str) -> None:
             except OSError:
                 init_working = False
         await ws.send_json({"type": "working", "on": init_working})
+        # A pending question card is (re)sent by the mirror within ~0.4s, and the
+        # phone restores it instantly from its own state on reconnect + dedupes
+        # re-sends — so no flicker without an explicit send here.
 
         lock = _cdp_lock(target_id)
         # The mirror continuously reflects whatever happens in this tab — live —
@@ -627,6 +630,7 @@ async def _mirror_loop(ws: WebSocket, ws_url: str, target_id: str, lock) -> None
     turn_done = False        # True once we've seen an end_turn since the last growth
     working_sent = None      # last "working" value pushed to the phone (emit on change)
     pending_card = False     # a question/permission card is currently shown
+    no_card_count = 0        # consecutive checks with no card (debounce the clear)
 
     def _key(evt: dict) -> str:
         if evt["type"] == "assistant":
@@ -707,12 +711,19 @@ async def _mirror_loop(ws: WebSocket, ws_url: str, target_id: str, lock) -> None
                             card = None
                 pending_card = card is not None
                 if card:
+                    no_card_count = 0
                     ckey = _card_key(card)
                     if ckey != last_card_key:
                         last_card_key = ckey
                         await ws.send_json({"type": "interactive", "data": card})
                 else:
-                    last_card_key = None
+                    # Only clear the card after 2 consecutive empty checks, so a
+                    # transient read miss can't blink it. Send an explicit null so
+                    # the phone removes it (e.g. the question got answered).
+                    no_card_count += 1
+                    if last_card_key is not None and no_card_count >= 2:
+                        last_card_key = None
+                        await ws.send_json({"type": "interactive", "data": None})
 
             # end_turn (turn_done) is the authoritative "finished" signal; the long
             # timeout is only a fallback for a missed end_turn, so the indicator
