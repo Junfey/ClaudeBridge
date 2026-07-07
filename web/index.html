@@ -83,6 +83,18 @@
   .msg.user.undelivered { opacity:.75; border:1px solid var(--warn); }
   .msg.user.undelivered::after { content:'⚠ нет связи — отправлю, как появится'; display:block; font-size:11px; color:var(--warn); margin-top:5px; }
   .msg.assistant { background:var(--panel); }
+  .msg.md { white-space:normal; }
+  .md-p { margin:0 0 8px; } .md-p:last-child { margin-bottom:0; }
+  .md-h { font-weight:700; margin:10px 0 6px; font-size:15px; } .md-h:first-child { margin-top:0; }
+  .md-li { margin:3px 0 3px 2px; padding-left:2px; }
+  .md-code { background:rgba(255,255,255,.09); padding:1px 5px; border-radius:4px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; overflow-wrap:anywhere; }
+  .md-pre { background:rgba(0,0,0,.32); border:1px solid var(--line); border-radius:8px;
+    padding:10px 12px; overflow-x:auto; margin:8px 0; -webkit-overflow-scrolling:touch; }
+  .md-pre code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12.5px;
+    white-space:pre; color:var(--fg); }
+  .md-hr { border:none; border-top:1px solid var(--line); margin:12px 0; }
+  .md-p a, .md-li a { color:var(--tool); }
   .msg.error { color:var(--err); }
   .tool { display:flex; align-items:center; gap:8px; font-size:12px; background:rgba(91,141,239,.12);
     color:var(--tool); padding:6px 10px; border-radius:8px; font-family:ui-monospace,monospace;
@@ -829,8 +841,52 @@ function enterDiskChat(sid,title,history){
   ws.onclose=()=>{ setSending(false); removeThinking(); };
 }
 
+// ── minimal, safe markdown → HTML (headings, bold/italic, code, lists) ──
+// Everything user/model text is HTML-escaped before any tag is added, so this
+// can't inject markup. Line-based so newlines render like VS Code, not raw.
+function renderMd(src){
+  const escHtml = s => String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  const inline = s => {
+    s = escHtml(s);
+    s = s.replace(/`([^`]+)`/g, (m,c)=>'<code class="md-code">'+c+'</code>');
+    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    s = s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+    s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    return s;
+  };
+  const lines = String(src||'').replace(/\r/g,'').split('\n');
+  let html='', i=0, inCode=false, code='', para=[];
+  const flushPara=()=>{ if(para.length){ html+='<div class="md-p">'+para.map(inline).join('<br>')+'</div>'; para=[]; } };
+  while(i<lines.length){
+    const ln=lines[i];
+    if(/^```/.test(ln)){
+      if(!inCode){ flushPara(); inCode=true; code=''; }
+      else { html+='<pre class="md-pre"><code>'+escHtml(code.replace(/\n$/,''))+'</code></pre>'; inCode=false; }
+      i++; continue;
+    }
+    if(inCode){ code+=ln+'\n'; i++; continue; }
+    let m;
+    if((m=ln.match(/^(#{1,6})\s+(.+)$/))){ flushPara(); html+='<div class="md-h">'+inline(m[2])+'</div>'; i++; continue; }
+    if((m=ln.match(/^\s*[-*+]\s+(.+)$/))){ flushPara(); html+='<div class="md-li">• '+inline(m[1])+'</div>'; i++; continue; }
+    if((m=ln.match(/^\s*(\d+)[.)]\s+(.+)$/))){ flushPara(); html+='<div class="md-li">'+m[1]+'. '+inline(m[2])+'</div>'; i++; continue; }
+    if(/^\s*(---+|___+|\*\*\*+)\s*$/.test(ln)){ flushPara(); html+='<hr class="md-hr">'; i++; continue; }
+    if(ln.trim()===''){ flushPara(); i++; continue; }
+    para.push(ln); i++;
+  }
+  if(inCode) html+='<pre class="md-pre"><code>'+escHtml(code.replace(/\n$/,''))+'</code></pre>';
+  flushPara();
+  return html;
+}
+
 // ── shared chat helpers ────────────────────────────────────────────
-function addMsg(chat,role,text){ const el=document.createElement('div'); el.className='msg '+role; el.textContent=text; chat.appendChild(el); scrollDown(); return el; }
+function addMsg(chat,role,text){
+  const el=document.createElement('div'); el.className='msg '+role;
+  // Render Claude's replies as markdown (bold, code, headings, lists) like VS
+  // Code; keep user/error messages as plain text.
+  if(role==='assistant'){ el.classList.add('md'); el.innerHTML=renderMd(text); }
+  else el.textContent=text;
+  chat.appendChild(el); scrollDown(); return el;
+}
 function addThinking(){ removeThinking(); const chat=$('chat'); if(!chat)return;
   const el=document.createElement('div'); el.className='thinking'; el.id='thinking';
   el.innerHTML='<span class="dot"></span>Claude думает…'; chat.appendChild(el); scrollDown(); }

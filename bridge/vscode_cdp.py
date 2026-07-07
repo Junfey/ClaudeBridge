@@ -587,48 +587,39 @@ async def read_limit(ws_url: str) -> str:
     return ""
 
 
+# The Effort slider moved INTO the / command menu (ext 2.1.x) — it's no longer
+# in the footer, so it must be opened first, like the model/thinking controls.
 async def read_effort(ws_url: str) -> dict:
-    async with websockets.connect(ws_url, max_size=30_000_000) as ws:
-        async with _CDPConn(ws) as conn:
-            await conn.call("Runtime.enable")
-            await asyncio.sleep(0.12)
-            for c in conn.collect_contexts():
-                try:
-                    r = await conn.eval_in(c["id"], _READ_EFFORT_JS)
-                except Exception:
-                    continue
-                if r:
-                    try:
-                        return json.loads(r)
-                    except Exception:
-                        pass
-    return {"index": 0, "count": 0}
+    async def fn(conn, cid):
+        if not await _open_menu(conn, cid):
+            return {"index": 0, "count": 0}
+        r = await conn.eval_in(cid, _READ_EFFORT_JS)
+        await conn.eval_in(cid, _ESC_JS)
+        if r:
+            try:
+                return json.loads(r)
+            except Exception:
+                pass
+        return {"index": 0, "count": 0}
+    return await _with_composer(ws_url, fn) or {"index": 0, "count": 0}
 
 
 async def set_effort(ws_url: str, index: int) -> dict:
-    async with websockets.connect(ws_url, max_size=30_000_000) as ws:
-        async with _CDPConn(ws) as conn:
-            await conn.call("Runtime.enable")
-            await asyncio.sleep(0.12)
-            ok = False
-            for c in conn.collect_contexts():
-                try:
-                    if await conn.eval_in(c["id"], _set_effort_js(index)):
-                        ok = True
-                        break
-                except Exception:
-                    continue
-            await asyncio.sleep(0.2)
-            new = {"index": index, "count": 0}
-            for c in conn.collect_contexts():
-                try:
-                    r = await conn.eval_in(c["id"], _READ_EFFORT_JS)
-                    if r:
-                        new = json.loads(r)
-                        break
-                except Exception:
-                    continue
-            return {"ok": ok, **new}
+    async def fn(conn, cid):
+        if not await _open_menu(conn, cid):
+            return {"ok": False, "index": 0, "count": 0}
+        ok = bool(await conn.eval_in(cid, _set_effort_js(index)))
+        await asyncio.sleep(0.25)
+        new = {"index": index, "count": 0}
+        r = await conn.eval_in(cid, _READ_EFFORT_JS)
+        if r:
+            try:
+                new = json.loads(r)
+            except Exception:
+                pass
+        await conn.eval_in(cid, _ESC_JS)
+        return {"ok": ok, **new}
+    return await _with_composer(ws_url, fn) or {"ok": False, "index": 0, "count": 0}
 
 
 _CLOSE_ONE_JS = r"""
