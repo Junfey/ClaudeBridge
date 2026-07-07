@@ -58,8 +58,14 @@ def _port_open(port: int) -> bool:
 def _kill_other_instances() -> None:
     """Enforce a single ClaudeBridge on this PC. A second instance would open a
     second tunnel fighting for the same stable subdomain (→ loca.lt routing
-    confusion / 503). So on startup, kill any OTHER instance and free the port,
-    then this one takes over cleanly."""
+    confusion / 503). So on startup, kill any OTHER copy of THIS program.
+
+    SAFETY: we ONLY ever target processes literally named `ClaudeBridge.exe`
+    (other copies of ourselves) — never by port and never any other program. A
+    game, browser, dev server, etc. can never be touched. Runs only in the
+    frozen build; from source we no-op (dev restarts by hand)."""
+    if not getattr(sys, "frozen", False):
+        return
     import time as _time
     try:
         import psutil
@@ -83,23 +89,14 @@ def _kill_other_instances() -> None:
         pass
 
     victims: set[int] = set()
-    # 1) Whoever is holding our port.
+    # Only other ClaudeBridge.exe processes — nothing else on the machine.
     try:
-        for conn in psutil.net_connections(kind="inet"):
-            if conn.laddr and conn.laddr.port == PORT and conn.pid and conn.pid not in keep:
-                victims.add(conn.pid)
+        for pr in psutil.process_iter(["pid", "name"]):
+            nm = (pr.info.get("name") or "").lower()
+            if nm == "claudebridge.exe" and pr.info["pid"] not in keep:
+                victims.add(pr.info["pid"])
     except Exception:
         pass
-    # 2) Any other ClaudeBridge.exe (frozen build only — from source we'd be a
-    #    generic python.exe and must not nuke unrelated Python processes).
-    if getattr(sys, "frozen", False):
-        try:
-            for pr in psutil.process_iter(["pid", "name"]):
-                nm = (pr.info.get("name") or "").lower()
-                if nm == "claudebridge.exe" and pr.info["pid"] not in keep:
-                    victims.add(pr.info["pid"])
-        except Exception:
-            pass
 
     for pid in victims:
         try:
