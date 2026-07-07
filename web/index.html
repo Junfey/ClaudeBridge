@@ -809,9 +809,16 @@ function addInteractive(chat, data) {
   const perm = data.kind === 'permission';
   el.className = 'icard' + (perm?' perm':'');
   const send = (label, isQ) => {
-    if (S.ws && S.ws.readyState===1) S.ws.send(JSON.stringify({type:'answer', button:label, question:!!isQ}));
-    S.card=null; S.cardKey='';  // answered → forget it (don't restore on reconnect)
-    el.remove(); addThinking();
+    // Only consume the card if we actually delivered the tap — otherwise keep it
+    // so the answer isn't silently lost while the connection is down.
+    if (S.ws && S.ws.readyState===1) {
+      S.ws.send(JSON.stringify({type:'answer', button:label, question:!!isQ}));
+      S.card=null; S.cardKey='';
+      el.remove(); addThinking();
+    } else {
+      setStatus(false);
+      if (S.view==='cdpchat' && S.cdpTarget) connectCdpWs();  // reconnect, keep the card
+    }
   };
   // Clarifying question(s): render every question with all its options AND
   // descriptions (same as VS Code), plus a hint that you can type your own

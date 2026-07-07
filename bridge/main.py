@@ -386,12 +386,13 @@ async def ws_cdp(ws: WebSocket, target_id: str) -> None:
     session_file = None
     mirror = None
     try:
-        # Clear VS Code's "done/unread" badge when you read on the phone: activate
-        # the tab so VS Code "views" it. SAFE only for already-rendered tabs (no
-        # fresh webview to race with). Sleeping tabs are activated by
-        # _ensure_rendered below, which clears the badge the same way.
+        # Opening a chat on the phone switches VS Code to that tab (which also
+        # clears its "done/unread" badge). SAFE only for ALREADY-rendered tabs —
+        # a single activation, no fresh webview to race with. Sleeping tabs are
+        # activated once by _ensure_rendered below. (Requiring only ws_url here —
+        # not done — restores the "phone switches the VS Code tab" behaviour.)
         _info = CDP_TABS_INFO.get(target_id) or {}
-        if _info.get("done") and _info.get("ws_url") and _info.get("page_ws_url") and _info.get("aria"):
+        if _info.get("ws_url") and _info.get("page_ws_url") and _info.get("aria"):
             try:
                 await vscode_cdp.activate_tab(_info["page_ws_url"], _info["aria"])
             except Exception:
@@ -514,17 +515,17 @@ async def ws_cdp(ws: WebSocket, target_id: str) -> None:
 
             elif kind == "answer":
                 button = (msg.get("button") or "").strip()
-                is_question = bool(msg.get("question"))
                 if button:
                     async with lock:
-                        if is_question:
-                            # A clarifying question is answered by sending the choice
-                            # as a message (same path as a custom typed answer) — the
-                            # deterministic, DOM-independent way to resolve it.
+                        # CLICK the matching option/button — works for both a
+                        # permission (Allow/Deny) and an AskUserQuestion option
+                        # (a role=radio div). NOTE: injecting the choice as a
+                        # message does NOT work while a question is up — the
+                        # composer is disabled ("focus failed"). Fall back to
+                        # inject only if nothing was clickable (composer is free).
+                        res = await vscode_cdp.click_button_by_text(ws_url, button)
+                        if not res.get("ok"):
                             res = await vscode_cdp.inject_and_submit(ws_url, button, submit=True)
-                        else:
-                            # Permission prompt: click the actual Allow/Deny button.
-                            res = await vscode_cdp.click_button_by_text(ws_url, button)
                     await ws.send_json({"type": "answer_result", **res})
                     if res.get("ok"):
                         await ws.send_json({"type": "thinking"})
