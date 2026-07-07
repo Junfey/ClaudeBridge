@@ -157,6 +157,58 @@ def _content_text(message: dict) -> str:
     return ""
 
 
+def pending_question(path: Path, tail_bytes: int = 400_000) -> dict | None:
+    """If the session's most recent AskUserQuestion tool hasn't been answered yet,
+    return its input {"questions":[{question,header,multiSelect,options:[{label,
+    description}]}]}; else None.
+
+    Read from the JSONL (canonical) rather than the webview DOM, so it survives
+    extension UI changes. A question is 'answered' once a tool_result with its
+    tool_use_id appears."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+    start = max(0, size - tail_bytes)
+    asked: dict[str, dict] = {}
+    order: list[str] = []
+    answered: set[str] = set()
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            f.seek(start)
+            if start:
+                f.readline()  # discard a partial first line after seeking mid-file
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    evt = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                content = (evt.get("message") or {}).get("content")
+                if not isinstance(content, list):
+                    continue
+                for b in content:
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("type") == "tool_use" and b.get("name") == "AskUserQuestion":
+                        tid = b.get("id")
+                        if tid:
+                            asked[tid] = b.get("input") or {}
+                            order.append(tid)
+                    elif b.get("type") == "tool_result":
+                        tid = b.get("tool_use_id")
+                        if tid:
+                            answered.add(tid)
+    except OSError:
+        return None
+    for tid in reversed(order):
+        if tid not in answered:
+            return asked.get(tid)
+    return None
+
+
 async def wait_for_active_session(
     since_ts: float, timeout: float = 20.0, project_key: str | None = None
 ) -> Path | None:

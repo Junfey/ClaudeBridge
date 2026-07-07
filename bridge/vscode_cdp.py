@@ -946,8 +946,13 @@ async def click_button_by_text(ws_url: str, button_text: str) -> dict:
                 ctx,
                 rf"""(() => {{
                     const want = {button_text!r}.trim().toLowerCase();
-                    const btns = [...document.querySelectorAll('button, [role="button"]')];
-                    const hit = btns.find(b => (b.textContent || '').trim().toLowerCase() === want);
+                    const sel = 'button, [role="button"], [role="option"], [role="radio"], [role="menuitemradio"], [role="menuitem"], li';
+                    const btns = [...document.querySelectorAll(sel)];
+                    // exact text match first, then an element whose text STARTS WITH
+                    // the label (question options render label + description together).
+                    let hit = btns.find(b => (b.textContent || '').trim().toLowerCase() === want);
+                    if (!hit && want.length > 2)
+                      hit = btns.find(b => (b.textContent || '').trim().toLowerCase().startsWith(want));
                     if (!hit) return {{ok:false, error:'button not found'}};
                     hit.click();
                     return {{ok:true}};

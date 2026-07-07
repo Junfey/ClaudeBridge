@@ -492,12 +492,21 @@ async def ws_cdp(ws: WebSocket, target_id: str) -> None:
 
             elif kind == "answer":
                 button = (msg.get("button") or "").strip()
+                is_question = bool(msg.get("question"))
                 if button:
                     async with lock:
-                        res = await vscode_cdp.click_button_by_text(ws_url, button)
+                        if is_question:
+                            # A clarifying question is answered by sending the choice
+                            # as a message (same path as a custom typed answer) — the
+                            # deterministic, DOM-independent way to resolve it.
+                            res = await vscode_cdp.inject_and_submit(ws_url, button, submit=True)
+                        else:
+                            # Permission prompt: click the actual Allow/Deny button.
+                            res = await vscode_cdp.click_button_by_text(ws_url, button)
                     await ws.send_json({"type": "answer_result", **res})
                     if res.get("ok"):
                         await ws.send_json({"type": "thinking"})
+                        await ws.send_json({"type": "working", "on": True})
 
             elif kind == "new_session":
                 async with lock:
@@ -564,6 +573,43 @@ def _tool_line(t: dict) -> str:
     return f"{name}: {detail}" if detail else name
 
 
+def _question_card(qinput: dict) -> dict | None:
+    """Turn an AskUserQuestion tool input into the phone's interactive-card shape.
+    Preserves every question + all its options + descriptions (same as VS Code)."""
+    qs = qinput.get("questions") if isinstance(qinput, dict) else None
+    if not qs:
+        return None
+    questions = []
+    for q in qs:
+        opts = [{"label": o.get("label", ""), "description": o.get("description", "")}
+                for o in (q.get("options") or []) if o.get("label")]
+        if not opts:
+            continue
+        questions.append({
+            "header": q.get("header", ""),
+            "question": q.get("question", ""),
+            "multiSelect": bool(q.get("multiSelect")),
+            "options": opts,
+        })
+    if not questions:
+        return None
+    first = questions[0]
+    return {
+        "kind": "question",
+        "title": first["header"],
+        "prompt": first["question"],
+        "questions": questions,
+        # flat options for the answer path (label match) — all questions' labels
+        "options": [{"label": o["label"], "kind": "choice"}
+                    for q in questions for o in q["options"]],
+    }
+
+
+def _card_key(card: dict) -> str:
+    return (card.get("prompt", "") + "|"
+            + "|".join(o["label"] for o in card.get("options", [])))
+
+
 async def _mirror_loop(ws: WebSocket, ws_url: str, target_id: str, lock) -> None:
     """Continuously mirror the tab's live state to the phone: tail the session
     JSONL for new events (from anyone — phone or VS Code) and surface pending
@@ -580,6 +626,7 @@ async def _mirror_loop(ws: WebSocket, ws_url: str, target_id: str, lock) -> None
     last_card_check = 0.0
     turn_done = False        # True once we've seen an end_turn since the last growth
     working_sent = None      # last "working" value pushed to the phone (emit on change)
+    pending_card = False     # a question/permission card is currently shown
 
     def _key(evt: dict) -> str:
         if evt["type"] == "assistant":
@@ -638,34 +685,45 @@ async def _mirror_loop(ws: WebSocket, ws_url: str, target_id: str, lock) -> None
             # growing and the turn hasn't ended; off on end_turn or after it
             # goes quiet. Emitted only on change so the phone shows a steady
             # "Claude работает…" that survives reconnects.
-            # end_turn (turn_done) is the authoritative "finished" signal; the long
-            # timeout is only a fallback for a missed end_turn, so the indicator
-            # doesn't wrongly clear during a slow tool run (tests, installs).
-            now_working = (session_file is not None
-                           and (_t.monotonic() - last_growth) < 45.0
-                           and not turn_done)
-            if now_working != working_sent:
-                working_sent = now_working
-                await ws.send_json({"type": "working", "on": now_working})
-
-            # When quiet, check for a pending interactive card (throttled).
+            # When quiet, check for a pending interactive card (throttled). Prefer
+            # the JSONL AskUserQuestion detector (version-independent) and fall
+            # back to a DOM scrape for permission prompts.
             quiet_for = _t.monotonic() - last_growth
-            if not grew and quiet_for >= 1.2 and (_t.monotonic() - last_card_check) >= 2.0:
+            if not grew and quiet_for >= 1.0 and (_t.monotonic() - last_card_check) >= 2.0:
                 last_card_check = _t.monotonic()
                 card = None
-                if not lock.locked():
+                if session_file is not None:
+                    try:
+                        qi = jsonl_watch.pending_question(session_file)
+                    except Exception:
+                        qi = None
+                    if qi:
+                        card = _question_card(qi)
+                if card is None and not lock.locked():
                     async with lock:
                         try:
                             card = await vscode_cdp.read_interactive(ws_url)
                         except Exception:
                             card = None
+                pending_card = card is not None
                 if card:
-                    ckey = card.get("prompt", "") + "|".join(o["label"] for o in card.get("options", []))
+                    ckey = _card_key(card)
                     if ckey != last_card_key:
                         last_card_key = ckey
                         await ws.send_json({"type": "interactive", "data": card})
                 else:
                     last_card_key = None
+
+            # end_turn (turn_done) is the authoritative "finished" signal; the long
+            # timeout is only a fallback for a missed end_turn, so the indicator
+            # doesn't wrongly clear during a slow tool run (tests, installs). A
+            # pending question means Claude is waiting for YOU, not working.
+            now_working = (session_file is not None
+                           and (_t.monotonic() - last_growth) < 45.0
+                           and not turn_done and not pending_card)
+            if now_working != working_sent:
+                working_sent = now_working
+                await ws.send_json({"type": "working", "on": now_working})
 
         except asyncio.CancelledError:
             return
@@ -925,8 +983,21 @@ async def _pending_watcher() -> None:
                     body = ""
                     actions: list[dict] = []
                     opts: dict[str, str] = {}
+                    labels: list[str] = []
+                    # 1) AskUserQuestion from JSONL (version-independent) → question
+                    #    text + options.
+                    if sf:
+                        try:
+                            qi = jsonl_watch.pending_question(Path(sf))
+                        except Exception:
+                            qi = None
+                        card = _question_card(qi) if qi else None
+                        if card:
+                            body = card.get("prompt") or (card.get("title") or "")
+                            labels = [o["label"] for o in card.get("options", [])]
+                    # 2) else a permission dialog from the DOM (rendered tabs).
                     ws_url = t.get("ws_url")
-                    if ws_url:  # rendered tab → read the actual question + options
+                    if not labels and ws_url:
                         try:
                             async with _cdp_lock(uid):
                                 card = await vscode_cdp.read_interactive(ws_url)
@@ -936,10 +1007,10 @@ async def _pending_watcher() -> None:
                             if card.get("prompt"):
                                 body = card["prompt"]
                             labels = [o.get("label", "") for o in card.get("options", []) if o.get("label")]
-                            for i, lab in enumerate(labels[:2]):  # Chrome shows ≤2 actions
-                                aid = f"opt:{i}"
-                                actions.append({"action": aid, "title": lab[:36]})
-                                opts[aid] = lab
+                    for i, lab in enumerate(labels[:2]):  # Chrome shows ≤2 actions
+                        aid = f"opt:{i}"
+                        actions.append({"action": aid, "title": lab[:36]})
+                        opts[aid] = lab
                     # No permission dialog (Claude just asked in text) → use the last
                     # assistant message as the body, so the push shows the question.
                     if not body and sf:

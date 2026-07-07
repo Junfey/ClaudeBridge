@@ -117,6 +117,9 @@
   .icard .iopts { padding:0 11px 11px; display:flex; flex-direction:column; gap:7px; }
   .icard .iopt { border:1px solid var(--line); border-radius:8px; padding:9px 11px; font-size:13px; cursor:pointer; }
   .icard .iopt:active { background:var(--panel); }
+  .icard .iopt-label { font-weight:600; }
+  .icard .iopt-desc { color:var(--muted); font-size:12px; margin-top:3px; line-height:1.35; }
+  .icard .iopt-hint { padding:2px 11px 11px; color:var(--muted); font-size:12px; }
   .icard .iopt.allow { background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600; text-align:center; }
   .icard .iopt.deny { text-align:center; color:var(--muted); }
   footer { display:none; padding:8px; border-top:1px solid var(--line); background:var(--panel); flex-direction:column; gap:6px; }
@@ -767,22 +770,45 @@ function addInteractive(chat, data) {
   const el = document.createElement('div');
   const perm = data.kind === 'permission';
   el.className = 'icard' + (perm?' perm':'');
+  const send = (label, isQ) => {
+    if (S.ws && S.ws.readyState===1) S.ws.send(JSON.stringify({type:'answer', button:label, question:!!isQ}));
+    el.remove(); addThinking();
+  };
+  // Clarifying question(s): render every question with all its options AND
+  // descriptions (same as VS Code), plus a hint that you can type your own
+  // answer in the message field below — the "свой вариант".
+  if (data.questions && data.questions.length) {
+    let html = `<div class="ihead q">❓ ${esc(data.title || 'Вопрос от Claude')}</div>`;
+    for (const q of data.questions) {
+      if (q.question && q.question !== data.title) html += `<div class="ibody">${esc(q.question)}</div>`;
+      html += '<div class="iopts">';
+      for (const o of (q.options||[])) {
+        html += `<div class="iopt" data-btn="${esc(o.label)}">
+                   <div class="iopt-label">${esc(o.label)}</div>
+                   ${o.description?`<div class="iopt-desc">${esc(o.description)}</div>`:''}
+                 </div>`;
+      }
+      html += '</div>';
+    }
+    html += `<div class="iopt-hint">…или напиши свой ответ в поле ниже ↓</div>`;
+    el.innerHTML = html;
+    chat.appendChild(el); scrollDown();
+    el.querySelectorAll('[data-btn]').forEach(b => b.onclick = () => send(b.dataset.btn, true));
+    return;
+  }
+  // Permission prompt (allow / deny).
   const shortLabel = s => s.length>60 ? s.slice(0,60)+'…' : s;
   const opts = (data.options||[]).map(o => {
     const cls = o.always ? 'allow' : (o.kind==='allow'?'allow':(o.kind==='deny'?'deny':''));
     return `<div class="iopt ${cls}" data-btn="${esc(o.label)}">${esc(shortLabel(o.label))}</div>`;
   }).join('');
-  const head = data.title ? esc(data.title) : (perm?'⚙ Разрешить действие?':'❓ Вопрос от Claude');
+  const head = data.title ? esc(data.title) : '⚙ Разрешить действие?';
   el.innerHTML =
-    `<div class="ihead ${perm?'perm':'q'}">${perm?'⚙ ':'❓ '}${head}</div>
+    `<div class="ihead perm">⚙ ${head}</div>
      ${data.prompt?`<div class="ibody">${esc(data.prompt.slice(0,600))}</div>`:''}
      <div class="iopts">${opts}</div>`;
   chat.appendChild(el); scrollDown();
-  el.querySelectorAll('[data-btn]').forEach(b =>
-    b.onclick = () => {
-      if (S.ws && S.ws.readyState===1) S.ws.send(JSON.stringify({type:'answer', button:b.dataset.btn}));
-      el.remove(); addThinking();
-    });
+  el.querySelectorAll('[data-btn]').forEach(b => b.onclick = () => send(b.dataset.btn, false));
 }
 
 // ── disk session flow (fallback / history) ─────────────────────────
