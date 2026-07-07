@@ -63,15 +63,37 @@ async def _one_connection(remote_host: str, remote_port: int, local_host: str, l
     await asyncio.gather(_pipe(r_reader, l_writer), _pipe(l_reader, r_writer))
 
 
+async def _request_tunnel_async(server: str, subdomain: str | None) -> dict:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, request_tunnel, server, subdomain)
+
+
 async def run_tunnel(local_port: int = 8765, server: str = "https://loca.lt",
                      on_url=None, subdomain: str | None = None) -> None:
     """Allocate a tunnel and keep its connection pool alive forever.
 
-    Requests `subdomain` if given (falls back to a random one if it's taken).
-    Calls on_url(url) once the public URL is known. Reconnects on any drop.
-    Runs until cancelled.
+    Requests `subdomain` if given. loca.lt hands out a RANDOM subdomain when the
+    requested one is still briefly held (e.g. a just-restarted instance whose old
+    tunnel hasn't timed out yet) — which would silently change the public URL and
+    break the QR/PWA. So retry a few times to reclaim the stable one before
+    accepting a random fallback. Calls on_url(url) once the URL is known.
+    Reconnects on any drop. Runs until cancelled.
     """
-    info = request_tunnel(server, subdomain)
+    info = None
+    if subdomain:
+        for attempt in range(6):
+            try:
+                cand = await _request_tunnel_async(server, subdomain)
+            except Exception:
+                cand = None
+            if cand:
+                info = cand  # keep the latest even if it's a fallback
+                got = (cand.get("id") or "") == subdomain or subdomain in (cand.get("url") or "")
+                if got:
+                    break  # reclaimed the stable subdomain
+            await asyncio.sleep(8)  # let the old tunnel's hold expire, then retry
+    if info is None:
+        info = await _request_tunnel_async(server, subdomain)
     remote_host = urlparse(server).hostname or "loca.lt"
     remote_port = int(info["port"])
     conns = max(1, int(info.get("max_conn_count", 1)))
