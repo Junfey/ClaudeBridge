@@ -266,12 +266,21 @@ def file_size(path: Path) -> int:
         return 0
 
 
-def context_usage(path: Path, limit: int = 1_000_000) -> dict | None:
+def context_usage(path: Path, limit: int = 1_000_000, tail_bytes: int = 1_000_000) -> dict | None:
     """Current context window usage, from the last request's token counts in
-    the JSONL (input + cache_read + cache_creation = prompt size that turn)."""
+    the JSONL (input + cache_read + cache_creation = prompt size that turn).
+
+    Reads only the TAIL of the file (the last `usage` line is in the most recent
+    assistant message) — scanning a 20-50 MB session top-to-bottom on the event
+    loop was a major source of lag/reconnects."""
     last = None
     try:
+        size = path.stat().st_size
+        start = max(0, size - tail_bytes)
         with path.open(encoding="utf-8", errors="replace") as f:
+            f.seek(start)
+            if start:
+                f.readline()  # skip a partial first line
             for line in f:
                 if '"usage"' not in line:
                     continue

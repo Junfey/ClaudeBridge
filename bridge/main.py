@@ -79,6 +79,13 @@ def _cdp_lock(target_id: str) -> "asyncio.Lock":
         _CDP_LOCKS[target_id] = lock
     return lock
 
+
+async def _off(fn, *args):
+    """Run a BLOCKING function (file stat/read/parse) in a thread so it never
+    freezes the event loop — a frozen loop stops every phone's WS heartbeat and
+    the tunnel pipes, which was the main cause of the drop/reconnect loops."""
+    return await asyncio.get_event_loop().run_in_executor(None, fn, *args)
+
 app = FastAPI(title="ClaudeBridge")
 
 
@@ -302,7 +309,7 @@ async def _build_claude_tabs() -> list[dict]:
 async def cdp_tabs() -> dict:
     # cdp=False means VS Code isn't running with the debug port — the phone can't
     # see any tabs then, so tell it that explicitly (not "no tabs found").
-    if not vscode_cdp.cdp_available():
+    if not await _off(vscode_cdp.cdp_available):
         return {"cdp": False, "tabs": []}
     tabs = await _build_claude_tabs()
     out = []
@@ -420,9 +427,9 @@ async def ws_cdp(ws: WebSocket, target_id: str) -> None:
 
         # Initial history from JSONL (clean) if we know the file, else DOM fallback.
         if session_file is not None:
-            events = jsonl_watch.read_events_from(session_file, 0)
+            events = await _off(jsonl_watch.read_events_from, session_file, 0)
             await ws.send_json({"type": "history", "messages": _events_to_history(events[-60:])})
-            cu = jsonl_watch.context_usage(session_file)
+            cu = await _off(jsonl_watch.context_usage, session_file)
             if cu:
                 await ws.send_json({"type": "context", **cu})
         else:
@@ -515,18 +522,16 @@ async def ws_cdp(ws: WebSocket, target_id: str) -> None:
 
             elif kind == "answer":
                 button = (msg.get("button") or "").strip()
+                cid = msg.get("cid")
                 if button:
                     async with lock:
-                        # CLICK the matching option/button — works for both a
-                        # permission (Allow/Deny) and an AskUserQuestion option
-                        # (a role=radio div). NOTE: injecting the choice as a
-                        # message does NOT work while a question is up — the
-                        # composer is disabled ("focus failed"). Fall back to
-                        # inject only if nothing was clickable (composer is free).
-                        res = await vscode_cdp.click_button_by_text(ws_url, button)
-                        if not res.get("ok"):
-                            res = await vscode_cdp.inject_and_submit(ws_url, button, submit=True)
-                    await ws.send_json({"type": "answer_result", **res})
+                        # Select the option + click "Submit answers" (a question
+                        # needs BOTH; a permission just needs the one click).
+                        res = await vscode_cdp.answer(ws_url, button)
+                    ack = {"type": "answer_result", **res}
+                    if cid:
+                        ack["cid"] = cid
+                    await ws.send_json(ack)
                     if res.get("ok"):
                         await ws.send_json({"type": "thinking"})
                         await ws.send_json({"type": "working", "on": True})
@@ -633,6 +638,26 @@ def _card_key(card: dict) -> str:
             + "|".join(o["label"] for o in card.get("options", [])))
 
 
+def _discover_session_file(baseline: dict) -> tuple[str, int] | None:
+    """(blocking, run in a thread) Find the chat started in a brand-new tab:
+    a JSONL that appeared since `baseline`, else one grown past its baseline."""
+    newf = grown = None
+    for f in jsonl_watch._all_session_files():
+        fp = str(f)
+        try:
+            sz = f.stat().st_size
+        except OSError:
+            continue
+        base = baseline.get(fp)
+        if base is None:
+            if sz > 0:
+                newf = (fp, 0)
+                break
+        elif sz > base and grown is None:
+            grown = (fp, base)
+    return newf or grown
+
+
 async def _mirror_loop(ws: WebSocket, ws_url: str, target_id: str, lock) -> None:
     """Continuously mirror the tab's live state to the phone: tail the session
     JSONL for new events (from anyone — phone or VS Code) and surface pending
@@ -642,11 +667,11 @@ async def _mirror_loop(ws: WebSocket, ws_url: str, target_id: str, lock) -> None
 
     sess = CDP_SESSION.get(target_id)
     session_file = _P(sess) if sess else None
-    pos = jsonl_watch.file_size(session_file) if session_file else None
+    pos = await _off(jsonl_watch.file_size, session_file) if session_file else None
     # For a brand-new tab (no session file yet) remember current file sizes, so we
     # can later latch onto the chat the user starts HERE — not replay an unrelated
     # session that just happens to be active elsewhere.
-    baseline = jsonl_watch.snapshot_sizes() if session_file is None else {}
+    baseline = await _off(jsonl_watch.snapshot_sizes) if session_file is None else {}
     seen: set[str] = set()
     last_card_key = None
     last_growth = 0.0        # "long ago" so an idle chat isn't reported as working
@@ -669,33 +694,19 @@ async def _mirror_loop(ws: WebSocket, ws_url: str, target_id: str, lock) -> None
             # the first message), else one that grew past its baseline — reading
             # only the new part. Never replays an unrelated already-active chat.
             if session_file is None:
-                newf = grown = None
-                for f in jsonl_watch._all_session_files():
-                    fp = str(f)
-                    try:
-                        sz = f.stat().st_size
-                    except OSError:
-                        continue
-                    base = baseline.get(fp)
-                    if base is None:
-                        if sz > 0:
-                            newf = (f, 0)
-                            break
-                    elif sz > base and grown is None:
-                        grown = (f, base)
-                pick = newf or grown
+                pick = await _off(_discover_session_file, baseline)
                 if pick:
-                    session_file = pick[0]
-                    CDP_SESSION[target_id] = str(pick[0])
+                    session_file = _P(pick[0])
+                    CDP_SESSION[target_id] = pick[0]
                     pos = pick[1]
 
             grew = False
             if session_file is not None:
-                size = jsonl_watch.file_size(session_file)
+                size = await _off(jsonl_watch.file_size, session_file)
                 if pos is None:
                     pos = size
                 if size > pos:
-                    events = jsonl_watch.read_events_from(session_file, pos)
+                    events = await _off(jsonl_watch.read_events_from, session_file, pos)
                     pos = size
                     grew = True
                     last_growth = _t.monotonic()
@@ -714,7 +725,7 @@ async def _mirror_loop(ws: WebSocket, ws_url: str, target_id: str, lock) -> None
                             if evt.get("stop_reason") == "end_turn":
                                 turn_done = True
                                 await ws.send_json({"type": "done"})
-                                cu = jsonl_watch.context_usage(session_file)
+                                cu = await _off(jsonl_watch.context_usage, session_file)
                                 if cu:
                                     await ws.send_json({"type": "context", **cu})
                             else:
@@ -738,7 +749,7 @@ async def _mirror_loop(ws: WebSocket, ws_url: str, target_id: str, lock) -> None
                 card = None
                 if session_file is not None:
                     try:
-                        qi = jsonl_watch.pending_question(session_file)
+                        qi = await _off(jsonl_watch.pending_question, session_file)
                     except Exception:
                         qi = None
                     if qi:
@@ -998,7 +1009,7 @@ async def cdp_answer_push(req: AnswerPushReq) -> dict:
     if not ws_url:
         raise HTTPException(404, "tab not rendered")
     async with _cdp_lock(req.target_id):
-        return await vscode_cdp.click_button_by_text(ws_url, req.button)
+        return await vscode_cdp.answer(ws_url, req.button)
 
 
 # ── Web Push ────────────────────────────────────────────────────────
@@ -1018,7 +1029,7 @@ async def _pending_watcher() -> None:
     first = True
     while True:
         try:
-            if vscode_cdp.cdp_available():
+            if await _off(vscode_cdp.cdp_available):
                 tabs = await _build_claude_tabs()
                 now_pending: set[str] = set()
                 for t in tabs:
@@ -1039,7 +1050,7 @@ async def _pending_watcher() -> None:
                     #    text + options.
                     if sf:
                         try:
-                            qi = jsonl_watch.pending_question(Path(sf))
+                            qi = await _off(jsonl_watch.pending_question, Path(sf))
                         except Exception:
                             qi = None
                         card = _question_card(qi) if qi else None
@@ -1067,8 +1078,8 @@ async def _pending_watcher() -> None:
                     if not body and sf:
                         try:
                             _p = Path(sf)
-                            _sz = jsonl_watch.file_size(_p)
-                            for e in jsonl_watch.read_events_from(_p, max(0, _sz - 200_000)):
+                            _sz = await _off(jsonl_watch.file_size, _p)
+                            for e in await _off(jsonl_watch.read_events_from, _p, max(0, _sz - 200_000)):
                                 if e.get("type") == "assistant" and e.get("text"):
                                     body = e["text"]
                         except Exception:

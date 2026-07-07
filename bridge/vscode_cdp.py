@@ -34,6 +34,12 @@ def _http_get(path: str) -> list | dict:
         return json.loads(resp.read())
 
 
+async def _to_thread(fn, *args):
+    """Run a blocking call (urlopen etc.) in a thread — never on the event loop.
+    A blocked loop stalls every phone's WS heartbeat → reconnect loops."""
+    return await asyncio.get_event_loop().run_in_executor(None, fn, *args)
+
+
 def cdp_available() -> bool:
     try:
         _http_get("/json/version")
@@ -79,8 +85,17 @@ class _CDPConn:
                     self._events.append(m)
         except Exception:
             pass
+        finally:
+            # Socket closed (VS Code reloaded / window shut). Fail every pending
+            # call immediately so `call()` returns at once instead of hanging its
+            # full 15s timeout — which would keep the tab's _cdp_lock held and
+            # freeze that chat for everyone.
+            for fut in self._pending.values():
+                if not fut.done():
+                    fut.set_exception(ConnectionError("CDP socket closed"))
+            self._pending.clear()
 
-    async def call(self, method: str, params: dict | None = None, timeout: float = 15):
+    async def call(self, method: str, params: dict | None = None, timeout: float = 8):
         self._id += 1
         fut = asyncio.get_event_loop().create_future()
         self._pending[self._id] = fut
@@ -159,7 +174,7 @@ async def list_claude_tabs() -> list[ClaudeTab]:
     """Enumerate live Claude chat webviews. Only renders that CDP has attached
     show up — background VS Code windows may not appear until focused."""
     tabs: list[ClaudeTab] = []
-    for t in _iter_claude_iframe_targets():
+    for t in await _to_thread(_iter_claude_iframe_targets):
         ws_url = t.get("webSocketDebuggerUrl")
         if not ws_url:
             continue
@@ -244,7 +259,7 @@ async def list_workbench_tabs() -> list[dict]:
     """All open editor tabs across all VS Code windows, tagged with the window
     (project) name and the page ws_url. Includes non-Claude tabs; caller filters."""
     out: list[dict] = []
-    for t in _http_get("/json/list"):
+    for t in await _to_thread(_http_get, "/json/list"):
         if t.get("type") != "page":
             continue
         page_ws = t.get("webSocketDebuggerUrl")
@@ -975,11 +990,87 @@ async def click_button_by_text(ws_url: str, button_text: str) -> dict:
                     if (!hit && want.length > 2)
                       hit = btns.find(b => (b.textContent || '').trim().toLowerCase().startsWith(want));
                     if (!hit) return {{ok:false, error:'button not found'}};
-                    hit.click();
-                    return {{ok:true}};
+                    // React option rows (role=radio divs) don't respond to a bare
+                    // .click() — dispatch a real pointer+mouse sequence at the
+                    // element's centre so the extension's handler actually fires.
+                    const r = hit.getBoundingClientRect();
+                    const o = {{bubbles:true, cancelable:true, view:window,
+                               clientX:r.left+r.width/2, clientY:r.top+r.height/2, button:0}};
+                    hit.dispatchEvent(new PointerEvent('pointerdown', Object.assign({{pointerId:1,isPrimary:true,buttons:1}}, o)));
+                    hit.dispatchEvent(new MouseEvent('mousedown', o));
+                    hit.dispatchEvent(new PointerEvent('pointerup', Object.assign({{pointerId:1,isPrimary:true}}, o)));
+                    hit.dispatchEvent(new MouseEvent('mouseup', o));
+                    hit.dispatchEvent(new MouseEvent('click', o));
+                    return {{ok:true, label:(hit.textContent||'').trim().slice(0,40)}};
                 }})()""",
             )
             return res or {"ok": False, "error": "no result"}
+
+
+# A realistic pointer+mouse click sequence — React option rows / buttons ignore
+# a bare .click(). Shared by the answer flow.
+_FIRE_JS = """
+  const fire = (el) => {
+    const r = el.getBoundingClientRect();
+    const o = {bubbles:true, cancelable:true, view:window,
+               clientX:r.left+r.width/2, clientY:r.top+r.height/2, button:0};
+    el.dispatchEvent(new PointerEvent('pointerdown', Object.assign({pointerId:1,isPrimary:true,buttons:1}, o)));
+    el.dispatchEvent(new MouseEvent('mousedown', o));
+    el.dispatchEvent(new PointerEvent('pointerup', Object.assign({pointerId:1,isPrimary:true}, o)));
+    el.dispatchEvent(new MouseEvent('mouseup', o));
+    el.dispatchEvent(new MouseEvent('click', o));
+  };
+"""
+
+_CLICK_SUBMIT_JS = (
+    "(() => {" + _FIRE_JS +
+    " const sb=[...document.querySelectorAll('button,[role=\"button\"]')]"
+    ".find(b=>/submit answers/i.test(b.textContent||''));"
+    " if(!sb) return JSON.stringify({submitted:false});"
+    " fire(sb); return JSON.stringify({submitted:true});})()"
+)
+
+
+def _select_option_js(label: str) -> str:
+    return (
+        "(() => {" + _FIRE_JS +
+        f" const want={label!r}.trim().toLowerCase();"
+        " const sel='button,[role=\"button\"],[role=\"option\"],[role=\"radio\"],[role=\"menuitemradio\"],[role=\"menuitem\"],li';"
+        " const btns=[...document.querySelectorAll(sel)];"
+        " let hit=btns.find(b=>(b.textContent||'').trim().toLowerCase()===want);"
+        " if(!hit) hit=btns.find(b=>(b.textContent||'').trim().toLowerCase().startsWith(want));"
+        " if(!hit) return JSON.stringify({ok:false,error:'option not found'});"
+        " fire(hit); return JSON.stringify({ok:true,hit:(hit.textContent||'').trim().slice(0,40)});})()"
+    )
+
+
+async def answer(ws_url: str, label: str) -> dict:
+    """Answer an interactive card by its option/button text.
+
+    AskUserQuestion needs TWO steps: SELECT the matching option, then click the
+    'Submit answers' button — selecting alone does NOT send (that was the "ответ
+    не отправляется" bug). A permission prompt has no submit button, so clicking
+    the Allow/Deny option is enough. Handles both: click the option, then click
+    Submit-answers if it's present."""
+    async with websockets.connect(ws_url, max_size=30_000_000) as ws:
+        async with _CDPConn(ws) as conn:
+            await conn.call("Runtime.enable")
+            await asyncio.sleep(0.2)
+            ctx = await conn.find_claude_context()
+            if ctx is None:
+                return {"ok": False, "error": "not a claude tab"}
+            try:
+                sel = json.loads(await conn.eval_in(ctx, _select_option_js(label)) or "{}")
+            except Exception:
+                sel = {}
+            if not sel.get("ok"):
+                return {"ok": False, "error": sel.get("error", "option not found")}
+            await asyncio.sleep(0.45)  # let React enable/render the Submit button
+            try:
+                sub = json.loads(await conn.eval_in(ctx, _CLICK_SUBMIT_JS) or "{}")
+            except Exception:
+                sub = {}
+            return {"ok": True, "hit": sel.get("hit"), "submitted": bool(sub.get("submitted"))}
 
 
 # Sync helpers for calling from non-async code / quick tests -----------------

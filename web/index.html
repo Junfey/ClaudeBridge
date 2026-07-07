@@ -116,6 +116,8 @@
   @keyframes pulse { 0%,100%{opacity:.3} 50%{opacity:1} }
   .icard { border:1px solid var(--accent); border-radius:12px; overflow:hidden; }
   .icard.perm { border-color:var(--err); }
+  .icard.answering { opacity:.55; pointer-events:none; }
+  .icard.answering::after { content:'отправляю ответ…'; display:block; padding:6px 11px 10px; color:var(--muted); font-size:12px; }
   .icard .ihead { padding:8px 11px; font-size:12px; font-weight:600; display:flex; align-items:center; gap:6px; }
   .icard .ihead.q { background:rgba(217,119,87,.15); color:var(--accent); }
   .icard .ihead.perm { background:rgba(255,123,114,.15); color:var(--err); }
@@ -299,7 +301,7 @@ async function loadHome() {
   } catch(e) { setStatus(false); }
 }
 
-let _offTimer=null, _wasOffline=false, _everOnline=false;
+let _offTimer=null, _wasOffline=false, _everOnline=false, _recoverTimer=null;
 function localNotify(title, body, tag){
   try{
     if(('Notification' in window) && Notification.permission==='granted' && navigator.serviceWorker){
@@ -314,8 +316,14 @@ function setStatus(on) {
     statusEl.textContent = '● online';
     statusEl.className = 'status online';
     _everOnline = true;
-    if (_wasOffline) { _wasOffline=false; localNotify('ClaudeBridge','Связь с ПК восстановлена ✅'); }
+    // Defer the "restored" toast — if the link flaps (restore→drop within a few
+    // seconds) don't spam it; only notify after staying online ~3s.
+    if (_wasOffline && !_recoverTimer) {
+      _recoverTimer = setTimeout(()=>{ _recoverTimer=null; _wasOffline=false;
+        localNotify('ClaudeBridge','Связь с ПК восстановлена ✅'); }, 3000);
+    }
   } else {
+    if (_recoverTimer) { clearTimeout(_recoverTimer); _recoverTimer=null; }  // cancel pending "restored"
     // Debounce: brief WS reconnects / one flaky poll shouldn't blink the badge.
     // Only show offline after staying down ~4s.
     if (_offTimer || statusEl.className.indexOf('offline')>=0) return;
@@ -698,6 +706,10 @@ function connectCdpWs() {
     setStatus(true);
     stopHb();
     flushOutbox();   // resend anything queued while we were disconnected
+    resendPendingAnswer();  // a tapped answer that hadn't been confirmed yet
+    // Reset the reconnect backoff once we've stayed open a few seconds (a stable
+    // connection), so a one-off blip doesn't permanently slow future reconnects.
+    setTimeout(()=>{ if(S.ws===ws && ws.readyState===1) S.reconnectDelay=800; }, 4000);
     S.hbTimer=setInterval(()=>{
       if(ws.readyState!==1) return;
       try{ ws.send(JSON.stringify({type:'ping'})); }catch(e){}
@@ -754,6 +766,14 @@ function connectCdpWs() {
           removeThinking(); setSending(false); addInteractive(chat, m.data);
         }
       }
+    } else if (m.type === 'answer_result') {
+      // Confirm (or fail) a tapped answer. Only NOW do we drop the card — so an
+      // answer lost in a drop keeps the card for a retry instead of vanishing.
+      if (S.pendingAnswer && (!m.cid || m.cid===S.pendingAnswer.cid)) {
+        S.pendingAnswer = null;
+        if (m.ok) { S.card=null; S.cardKey=''; removeInteractive(); if(S.view==='cdpchat'){ removeThinking(); addThinking(); } }
+        else { document.querySelectorAll('.icard.answering').forEach(e=>e.classList.remove('answering')); }
+      }
     } else if (m.type === 'done') {
       removeThinking(); setSending(false);
     } else if (m.type === 'error') {
@@ -765,10 +785,14 @@ function connectCdpWs() {
   ws.onclose = () => {
     stopHb();
     setSending(false); removeThinking();
-    // Auto-reconnect while still on this chat, so the send button never dies.
+    // Auto-reconnect while still on this chat, with exponential backoff + jitter
+    // so a flapping tunnel doesn't storm the server with handshakes (which would
+    // starve it further → worse flapping). Backoff resets after a stable open.
     if (S.view === 'cdpchat' && S.cdpTarget) {
       setStatus(false);
-      setTimeout(() => { if (S.view === 'cdpchat') connectCdpWs(); }, 1500);
+      const d = S.reconnectDelay || 800;
+      S.reconnectDelay = Math.min(15000, d * 2);
+      setTimeout(() => { if (S.view === 'cdpchat') connectCdpWs(); }, d + Math.random()*400);
     }
   };
 }
@@ -802,6 +826,11 @@ function cardKeyOf(d){ if(!d) return '';
   return (d.title||'')+'|'+((d.options||[]).map(o=>o.label).join('~'))
     +'|'+((d.questions||[]).map(q=>q.question+':'+(q.options||[]).map(o=>o.label).join(',')).join('~')); }
 function removeInteractive(){ document.querySelectorAll('.icard').forEach(e=>e.remove()); }
+function resendPendingAnswer(){
+  if(!S.pendingAnswer || !S.ws || S.ws.readyState!==1) return;
+  const p=S.pendingAnswer;
+  try{ S.ws.send(JSON.stringify({type:'answer', button:p.button, question:p.question, cid:p.cid})); }catch(e){}
+}
 
 function addInteractive(chat, data) {
   removeInteractive();  // never stack cards — one at a time
@@ -809,16 +838,22 @@ function addInteractive(chat, data) {
   const perm = data.kind === 'permission';
   el.className = 'icard' + (perm?' perm':'');
   const send = (label, isQ) => {
-    // Only consume the card if we actually delivered the tap — otherwise keep it
-    // so the answer isn't silently lost while the connection is down.
+    // Durable answer: keep the card (dimmed) until the SERVER confirms it via
+    // answer_result. If the frame is lost in a drop, resendPendingAnswer() fires
+    // it again on reconnect — the answer can't be silently lost.
+    const cid = newCid();
+    S.pendingAnswer = { cid, button: label, question: !!isQ };
+    el.classList.add('answering');
     if (S.ws && S.ws.readyState===1) {
-      S.ws.send(JSON.stringify({type:'answer', button:label, question:!!isQ}));
-      S.card=null; S.cardKey='';
-      el.remove(); addThinking();
+      try { S.ws.send(JSON.stringify({type:'answer', button:label, question:!!isQ, cid})); }catch(e){}
     } else {
       setStatus(false);
-      if (S.view==='cdpchat' && S.cdpTarget) connectCdpWs();  // reconnect, keep the card
+      if (S.view==='cdpchat' && S.cdpTarget) connectCdpWs();  // resends on open
     }
+    // If not confirmed in 6s, un-dim so the user can re-tap (still resends on
+    // reconnect meanwhile).
+    setTimeout(()=>{ if(S.pendingAnswer && S.pendingAnswer.cid===cid)
+      document.querySelectorAll('.icard.answering').forEach(e=>e.classList.remove('answering')); }, 6000);
   };
   // Clarifying question(s): render every question with all its options AND
   // descriptions (same as VS Code), plus a hint that you can type your own
@@ -1273,7 +1308,17 @@ function clearBadges(){
       .then(reg=>reg.getNotifications().then(ns=>ns.forEach(n=>n.close()))).catch(()=>{});
   }catch(e){}
 }
-document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) clearBadges(); });
+document.addEventListener('visibilitychange', ()=>{
+  if(document.hidden) return;
+  clearBadges();
+  // Mobile freezes timers while backgrounded, so the heartbeat can't detect a
+  // dead socket. On return, verify liveness immediately: reconnect now if the
+  // socket is gone, else ping to force a fast drop-check.
+  if(S.view==='cdpchat' && S.cdpTarget){
+    if(!S.ws || S.ws.readyState!==1){ S.reconnectDelay=800; connectCdpWs(); }
+    else { try{ S.ws.send(JSON.stringify({type:'ping'})); }catch(e){} }
+  }
+});
 window.addEventListener('focus', clearBadges);
 
 // Stash the auth key where the service worker can read it, so answering from a

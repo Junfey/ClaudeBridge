@@ -76,11 +76,21 @@ async def _one_connection(remote_host: str, remote_port: int, local_host: str,
     health["est"] += 1
     in_idle = True
     try:
-        first = await r_reader.read(65536)  # blocks until loca.lt sends a request
+        try:
+            # Idle until loca.lt routes a request. Bounded: if a connection sits
+            # idle for 90s it's cycled — so if loca.lt silently stops routing to
+            # our pooled connections, they get refreshed instead of hanging.
+            first = await asyncio.wait_for(r_reader.read(65536), timeout=90)
+        except asyncio.TimeoutError:
+            return
         if not first:
-            return  # connection closed before any request
+            # loca.lt accepted then closed it with no request → churn signal.
+            health["empty"] = health.get("empty", 0) + 1
+            return
         health["idle"] -= 1
         in_idle = False
+        health["served"] = health.get("served", 0) + 1
+        health["empty"] = 0  # a real request routed → not churning
         try:
             l_reader, l_writer = await asyncio.open_connection(local_host, local_port)
         except Exception:
@@ -159,7 +169,7 @@ async def run_tunnel(local_port: int = 8765, server: str = "https://loca.lt",
             except Exception:
                 pass
 
-        health = {"opening": 0, "idle": 0, "est": 0}
+        health = {"opening": 0, "idle": 0, "est": 0, "empty": 0, "served": 0}
         tasks: set = set()
         cap = max(conns * 4, 12)  # hard ceiling on total connections
 
@@ -176,16 +186,28 @@ async def run_tunnel(local_port: int = 8765, server: str = "https://loca.lt",
             while True:
                 # Keep `conns` connections READY (idle/connecting); each one that
                 # starts serving a request gets replaced, so a long-lived
-                # WebSocket never starves the pool.
-                while (health["idle"] + health["opening"]) < conns and len(tasks) < cap:
-                    spawn()
-                await asyncio.sleep(0.5)
-                # Dead-port detection: no connection established for ~20s → refresh.
+                # WebSocket never starves the pool. Churn guard: if loca.lt keeps
+                # accepting-then-closing connections with no request (health.empty
+                # climbing), don't hammer it in a tight loop.
+                churn = health["empty"]
+                if churn < 3:
+                    while (health["idle"] + health["opening"]) < conns and len(tasks) < cap:
+                        spawn()  # healthy: fill the pool fast
+                    await asyncio.sleep(0.5)
+                else:
+                    if (health["idle"] + health["opening"]) < conns and len(tasks) < cap:
+                        spawn()  # churning: one at a time, backed off
+                    await asyncio.sleep(min(5.0, 0.5 * churn))
+                # Dead-port: no connection established for ~20s → refresh tunnel.
                 if health["est"] > 0:
                     zero_since = None
                 elif zero_since is None:
                     zero_since = time.monotonic()
                 elif time.monotonic() - zero_since > 20:
+                    break
+                # loca.lt "connected but never routes / keeps closing" — many
+                # empty opens and nothing served ⇒ this tunnel is bad, re-acquire.
+                if health["empty"] >= 12 and health["served"] == 0:
                     break
                 # Background reclaim of the stable subdomain while on a fallback.
                 if not on_stable and time.monotonic() >= next_reclaim:
