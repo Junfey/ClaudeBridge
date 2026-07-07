@@ -55,6 +55,18 @@ def _port_open(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def _raise_priority() -> None:
+    """Nudge our process priority up a notch so a fullscreen game + Windows Game
+    Mode (which throttles background apps) can't starve the tunnel/heartbeat and
+    cause phone drops. Above-normal needs no admin; the bridge uses almost no CPU,
+    so this just means it gets the tiny slice it needs promptly."""
+    try:
+        import psutil
+        psutil.Process().nice(psutil.ABOVE_NORMAL_PRIORITY_CLASS)
+    except Exception:
+        pass
+
+
 def _kill_other_instances() -> None:
     """Enforce a single ClaudeBridge on this PC. A second instance would open a
     second tunnel fighting for the same stable subdomain (→ loca.lt routing
@@ -360,6 +372,7 @@ class App:
     def boot(self) -> None:
         # One tunnel per PC: kill any other instance + free the port first.
         _kill_other_instances()
+        _raise_priority()  # survive Windows Game Mode throttling a running game
         self.check_vscode()
         threading.Thread(target=self.start_bridge, daemon=True).start()
         threading.Thread(target=self.start_tunnel, daemon=True).start()

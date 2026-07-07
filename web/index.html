@@ -698,8 +698,11 @@ function connectCdpWs() {
   const proto = location.protocol==='https:'?'wss':'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws/cdp/${S.cdpTarget}${wsKey()}`);
   S.ws = ws;
-  // Heartbeat: ping every 20s; if no pong within 8s the connection is half-dead,
-  // so force-close it → onclose reconnects. Catches silent drops the browser misses.
+  // Heartbeat: ping every 20s; if no pong within 15s the connection is half-dead,
+  // so force-close it → onclose reconnects. 15s (not 8s) so a transient CPU/
+  // network spike — e.g. a fullscreen game hogging the uplink / Windows Game Mode
+  // throttling the PC — doesn't force a false drop. A visibilitychange re-check
+  // still catches a truly dead socket instantly when you return to the app.
   let pongTimer=null;
   const stopHb=()=>{ if(S.hbTimer){clearInterval(S.hbTimer);S.hbTimer=null;} if(pongTimer){clearTimeout(pongTimer);pongTimer=null;} };
   ws.onopen = () => {
@@ -713,7 +716,7 @@ function connectCdpWs() {
     S.hbTimer=setInterval(()=>{
       if(ws.readyState!==1) return;
       try{ ws.send(JSON.stringify({type:'ping'})); }catch(e){}
-      if(!pongTimer) pongTimer=setTimeout(()=>{ try{ ws.close(); }catch(e){} }, 8000);
+      if(!pongTimer) pongTimer=setTimeout(()=>{ try{ ws.close(); }catch(e){} }, 15000);
     }, 20000);
   };
   ws.onmessage = ev => {
