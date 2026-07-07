@@ -55,6 +55,73 @@ def _port_open(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def _kill_other_instances() -> None:
+    """Enforce a single ClaudeBridge on this PC. A second instance would open a
+    second tunnel fighting for the same stable subdomain (→ loca.lt routing
+    confusion / 503). So on startup, kill any OTHER instance and free the port,
+    then this one takes over cleanly."""
+    import time as _time
+    try:
+        import psutil
+    except Exception:
+        return
+    me = os.getpid()
+    keep = {me}
+    # Don't kill our own process tree — the onefile exe is a bootloader + child,
+    # both named ClaudeBridge.exe.
+    try:
+        p = psutil.Process(me)
+        roots = [p]
+        par = p.parent()
+        if par:
+            roots.append(par)
+        for r in roots:
+            keep.add(r.pid)
+            for c in r.children(recursive=True):
+                keep.add(c.pid)
+    except Exception:
+        pass
+
+    victims: set[int] = set()
+    # 1) Whoever is holding our port.
+    try:
+        for conn in psutil.net_connections(kind="inet"):
+            if conn.laddr and conn.laddr.port == PORT and conn.pid and conn.pid not in keep:
+                victims.add(conn.pid)
+    except Exception:
+        pass
+    # 2) Any other ClaudeBridge.exe (frozen build only — from source we'd be a
+    #    generic python.exe and must not nuke unrelated Python processes).
+    if getattr(sys, "frozen", False):
+        try:
+            for pr in psutil.process_iter(["pid", "name"]):
+                nm = (pr.info.get("name") or "").lower()
+                if nm == "claudebridge.exe" and pr.info["pid"] not in keep:
+                    victims.add(pr.info["pid"])
+        except Exception:
+            pass
+
+    for pid in victims:
+        try:
+            psutil.Process(pid).terminate()
+        except Exception:
+            pass
+    if victims:
+        # Give them a moment, then force-kill stragglers, then wait for the port.
+        _time.sleep(0.6)
+        for pid in victims:
+            try:
+                pr = psutil.Process(pid)
+                if pr.is_running():
+                    pr.kill()
+            except Exception:
+                pass
+        for _ in range(30):
+            if not _port_open(PORT):
+                break
+            _time.sleep(0.15)
+
+
 def _find_vscode() -> str | None:
     """Locate VS Code (or Insiders) anywhere it's normally installed:
     registry (App Paths + Uninstall) → common folders → PATH."""
@@ -283,10 +350,19 @@ class App:
                                  "tag": "cb-off", "url": "/"})
         except Exception:
             pass
-        self.root.destroy()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        # Force-terminate the whole process so the tunnel's TCP connections close
+        # immediately (OS sends RST) — no lingering tunnel holding the subdomain.
+        # Daemon threads (bridge/tunnel) would otherwise keep sockets half-open.
+        os._exit(0)
 
     # ── startup ─────────────────────────────────────────────────
     def boot(self) -> None:
+        # One tunnel per PC: kill any other instance + free the port first.
+        _kill_other_instances()
         self.check_vscode()
         threading.Thread(target=self.start_bridge, daemon=True).start()
         threading.Thread(target=self.start_tunnel, daemon=True).start()

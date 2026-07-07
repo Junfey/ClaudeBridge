@@ -116,15 +116,21 @@ async def run_tunnel(local_port: int = 8765, server: str = "https://loca.lt",
     on_url(url) whenever the public URL (re)appears. Runs until cancelled."""
     remote_host = urlparse(server).hostname or "loca.lt"
     last_url = None
+    pending = None  # a pre-acquired tunnel to switch to (from background reclaim)
     while True:
         try:
-            info = await _acquire(server, subdomain)
+            info = pending or await _acquire(server, subdomain)
         except Exception:
             await asyncio.sleep(3)
             continue
+        pending = None
         remote_port = int(info["port"])
         conns = max(1, int(info.get("max_conn_count", 1)))
         url = info["url"]
+        # On the stable subdomain? If not, we're on a random fallback (e.g. the
+        # stable one was briefly held by a just-killed old instance) and must
+        # keep trying to reclaim it in the background so the QR/PWA URL returns.
+        on_stable = (not subdomain) or (subdomain in url)
         if on_url and url != last_url:
             last_url = url
             try:
@@ -146,6 +152,7 @@ async def run_tunnel(local_port: int = 8765, server: str = "https://loca.lt",
         # Health monitor: if NO connection is established for ~20s, this tunnel's
         # data port is dead — tear it down and loop to acquire a new one.
         zero_since = time.monotonic()
+        next_reclaim = time.monotonic() + 25
         try:
             while True:
                 await asyncio.sleep(3)
@@ -155,6 +162,16 @@ async def run_tunnel(local_port: int = 8765, server: str = "https://loca.lt",
                     zero_since = time.monotonic()
                 elif time.monotonic() - zero_since > 20:
                     break  # pool has had no live connection for 20s → refresh
+                # Background reclaim of the stable subdomain while on a fallback.
+                if not on_stable and time.monotonic() >= next_reclaim:
+                    next_reclaim = time.monotonic() + 25
+                    try:
+                        cand = await _request_tunnel_async(server, subdomain)
+                    except Exception:
+                        cand = None
+                    if cand and (subdomain in (cand.get("url") or "")):
+                        pending = cand  # reclaimed! switch to it on the next loop
+                        break
         finally:
             stop.set()
             for w in workers:
