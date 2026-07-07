@@ -54,27 +54,48 @@ async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> N
 
 
 async def _one_connection(remote_host: str, remote_port: int, local_host: str,
-                          local_port: int, health: dict | None = None) -> None:
-    """Bridge a single tunnel connection <-> the local service.
+                          local_port: int, health: dict) -> None:
+    """One tunnel connection: open to loca.lt, wait IDLE until it routes a request,
+    then pipe it to the local service.
 
-    `health["active"]` counts connections that are currently ESTABLISHED (in the
-    pipe phase). A 10s connect timeout means a dead loca.lt data port (packets
-    stuck in SYN_SENT) fails fast instead of hanging ~20s, so the supervisor can
-    notice the pool is empty and grab a fresh tunnel."""
-    r_reader, r_writer = await asyncio.wait_for(
-        asyncio.open_connection(remote_host, remote_port), timeout=10)
-    if health is not None:
-        health["active"] = health.get("active", 0) + 1
+    `health` tracks the pool: `opening` (connecting), `idle` (established, waiting
+    for a request), `est` (established total). The pool manager spawns a
+    replacement the moment a connection leaves `idle` (starts serving) so a
+    long-lived stream (WebSocket) never shrinks the number of connections ready to
+    accept new requests — the old code kept only max_conn_count total, so one
+    WebSocket left just one connection for everything else → the tunnel dropped
+    under load. A 10s connect timeout makes a dead data port fail fast."""
     try:
+        r_reader, r_writer = await asyncio.wait_for(
+            asyncio.open_connection(remote_host, remote_port), timeout=10)
+    except BaseException:
+        health["opening"] -= 1
+        raise
+    health["opening"] -= 1
+    health["idle"] += 1
+    health["est"] += 1
+    in_idle = True
+    try:
+        first = await r_reader.read(65536)  # blocks until loca.lt sends a request
+        if not first:
+            return  # connection closed before any request
+        health["idle"] -= 1
+        in_idle = False
         try:
             l_reader, l_writer = await asyncio.open_connection(local_host, local_port)
         except Exception:
-            r_writer.close()
-            raise
+            return
+        l_writer.write(first)
+        await l_writer.drain()
         await asyncio.gather(_pipe(r_reader, l_writer), _pipe(l_reader, r_writer))
     finally:
-        if health is not None:
-            health["active"] = health.get("active", 1) - 1
+        if in_idle:
+            health["idle"] -= 1
+        health["est"] -= 1
+        try:
+            r_writer.close()
+        except Exception:
+            pass
 
 
 async def _request_tunnel_async(server: str, subdomain: str | None) -> dict:
@@ -138,30 +159,34 @@ async def run_tunnel(local_port: int = 8765, server: str = "https://loca.lt",
             except Exception:
                 pass
 
-        health = {"active": 0}
-        stop = asyncio.Event()
+        health = {"opening": 0, "idle": 0, "est": 0}
+        tasks: set = set()
+        cap = max(conns * 4, 12)  # hard ceiling on total connections
 
-        async def worker() -> None:
-            while not stop.is_set():
-                try:
-                    await _one_connection(remote_host, remote_port, "127.0.0.1", local_port, health)
-                except Exception:
-                    await asyncio.sleep(1.0)  # backoff on failure
+        def spawn() -> None:
+            health["opening"] += 1
+            t = asyncio.create_task(
+                _one_connection(remote_host, remote_port, "127.0.0.1", local_port, health))
+            tasks.add(t)
+            t.add_done_callback(tasks.discard)
 
-        workers = [asyncio.create_task(worker()) for _ in range(conns)]
-        # Health monitor: if NO connection is established for ~20s, this tunnel's
-        # data port is dead — tear it down and loop to acquire a new one.
-        zero_since = time.monotonic()
+        zero_since = None
         next_reclaim = time.monotonic() + 25
         try:
             while True:
-                await asyncio.sleep(3)
-                if health["active"] > 0:
+                # Keep `conns` connections READY (idle/connecting); each one that
+                # starts serving a request gets replaced, so a long-lived
+                # WebSocket never starves the pool.
+                while (health["idle"] + health["opening"]) < conns and len(tasks) < cap:
+                    spawn()
+                await asyncio.sleep(0.5)
+                # Dead-port detection: no connection established for ~20s → refresh.
+                if health["est"] > 0:
                     zero_since = None
                 elif zero_since is None:
                     zero_since = time.monotonic()
                 elif time.monotonic() - zero_since > 20:
-                    break  # pool has had no live connection for 20s → refresh
+                    break
                 # Background reclaim of the stable subdomain while on a fallback.
                 if not on_stable and time.monotonic() >= next_reclaim:
                     next_reclaim = time.monotonic() + 25
@@ -173,10 +198,9 @@ async def run_tunnel(local_port: int = 8765, server: str = "https://loca.lt",
                         pending = cand  # reclaimed! switch to it on the next loop
                         break
         finally:
-            stop.set()
-            for w in workers:
-                w.cancel()
-            await asyncio.gather(*workers, return_exceptions=True)
+            for t in list(tasks):
+                t.cancel()
+            await asyncio.gather(*list(tasks), return_exceptions=True)
         await asyncio.sleep(1)  # brief pause before re-acquiring
 
 
