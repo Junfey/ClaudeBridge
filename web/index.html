@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#0b0d10">
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="apple-touch-icon" href="/static/icon-192.png">
@@ -19,7 +19,9 @@
   * { box-sizing:border-box; }
   html,body { margin:0; padding:0; background:var(--bg); color:var(--fg);
     font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-    overscroll-behavior:none; max-width:100%; overflow-x:hidden; height:100%; }
+    overscroll-behavior:none; max-width:100%; overflow-x:hidden; height:100%;
+    touch-action:pan-x pan-y;   /* no pinch-zoom / double-tap-zoom of the page */
+    -webkit-text-size-adjust:100%; }
   /* 100dvh accounts for the mobile address bar so the footer never slips below
      the visible area (100vh would push it off-screen). */
   /* The body itself must NEVER scroll or shift — only <main> scrolls vertically.
@@ -547,6 +549,7 @@ function openCdpTab(tab) {
   // Show a loading spinner right away — activating a sleeping tab + fetching
   // history can take several seconds, and a blank black screen looks broken.
   main.innerHTML = '<div class="chat" id="chat"><div class="chat-loading" id="chatloading"><span class="spin"></span>загружаю чат…</div></div>';
+  _stick = true;   // a freshly opened chat follows new messages
 
   S.cdpTarget = tab.target_id;
   S.card=null; S.cardKey='';     // reset any pending-question card from another chat
@@ -732,7 +735,7 @@ function connectCdpWs() {
       }
       renderOutboxPending(chat);  // show messages still queued for delivery
       if (S.card) addInteractive(chat, S.card);  // restore a still-pending question card
-      scrollDown();
+      scrollDown(true);           // jump to the end on (re)load
     } else if (m.type === 'sent') {
       // Delivery confirmed → drop from the queue and clear the "pending" mark.
       if (m.cid) { outboxRemove(m.cid); markBubble(m.cid, 'ok'); }
@@ -993,8 +996,22 @@ function addMsg(chat,role,text){
   const el=document.createElement('div'); el.className='msg '+role;
   // Render Claude's replies as markdown (bold, code, headings, lists) like VS
   // Code; keep user/error messages as plain text.
-  if(role==='assistant'){ el.classList.add('md'); el.innerHTML=renderMd(text); }
-  else el.textContent=text;
+  if(role==='assistant'){ el.classList.add('md'); el.innerHTML=renderMd(text); chat.appendChild(el); scrollDown(); return el; }
+  if(role==='user'){
+    // On history reload a sent image is just its upload path in the text — turn
+    // those back into pictures so they show like when they were sent.
+    const re=/[A-Za-z]:[\\\/][^\s"']*?claudebridge-uploads[\\\/][^\s"']+?\.(?:png|jpe?g|gif|webp|bmp)/gi;
+    const matches = text.match(re) || [];
+    if(matches.length){
+      const names = matches.map(p=>p.split(/[\\\/]/).pop());
+      let clean=text; for(const p of matches) clean=clean.split(p).join('');
+      clean=clean.replace(/Прикреплённые файлы[^:]*:/,'').replace(/[ \t]+/g,' ').replace(/\n{2,}/g,'\n').trim();
+      if(clean){ el.textContent=clean; chat.appendChild(el); }
+      addImages(chat, names.map(n=>'/api/uploaded/'+encodeURIComponent(n)+wsKey()));
+      scrollDown(); return el;
+    }
+  }
+  el.textContent=text;
   chat.appendChild(el); scrollDown(); return el;
 }
 function addThinking(){ removeThinking(); const chat=$('chat'); if(!chat)return;
@@ -1002,7 +1019,15 @@ function addThinking(){ removeThinking(); const chat=$('chat'); if(!chat)return;
   el.innerHTML='<span class="dot"></span>Claude думает…'; chat.appendChild(el); scrollDown(); }
 function removeThinking(){ const t=$('thinking'); if(t)t.remove(); }
 function setSending(on){ sendBtn.disabled=on; sendBtn.textContent=on?'…':'▶'; }
-function scrollDown(){ main.scrollTop=main.scrollHeight; }
+// Sticky auto-scroll: follow new messages ONLY while the user is already near
+// the bottom. If they scrolled up to read, live updates must NOT yank them down
+// (that was the "chat jumps to the end when I scroll a bit" bug). `force` (chat
+// open / send) always jumps to the end.
+let _stick=true;
+main.addEventListener('scroll', ()=>{
+  _stick = (main.scrollHeight - main.scrollTop - main.clientHeight) < 140;
+}, {passive:true});
+function scrollDown(force){ if(force || _stick) main.scrollTop=main.scrollHeight; }
 function esc(s){ return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function openLightbox(src){
   const lb=document.createElement('div'); lb.className='lightbox';
@@ -1119,6 +1144,7 @@ function newCid(){ return Date.now().toString(36)+Math.random().toString(36).sli
 
 // ── send (text + attachments) ──────────────────────────────────────
 sendBtn.onclick=async ()=>{
+  _stick = true;   // when you send, follow the conversation to the end
   const text=input.value.trim();
   if(!text && !attached.length) return;
   if(recognizing) recog.stop();
@@ -1188,6 +1214,17 @@ function sbSnap(){
   setTimeout(()=>{ document.body.style.transition=''; }, 250);
 }
 $('drawerBack').addEventListener('click', closeDrawer);
+// Kill pinch-zoom / double-tap-zoom of the whole page (iOS ignores the viewport
+// user-scalable=no, so block the gestures directly).
+document.addEventListener('gesturestart', e=>e.preventDefault());
+document.addEventListener('gesturechange', e=>e.preventDefault());
+document.addEventListener('touchmove', e=>{ if(e.touches.length>1) e.preventDefault(); }, {passive:false});
+let _lastTouchEnd=0;
+document.addEventListener('touchend', e=>{
+  const now=Date.now();
+  if(now-_lastTouchEnd<300) e.preventDefault();  // double-tap zoom
+  _lastTouchEnd=now;
+}, {passive:false});
 document.addEventListener('touchstart', e=>{
   if(e.touches.length!==1){ sbActive=false; return; }
   const t=e.touches[0]; sbX=t.clientX; sbY=t.clientY; sbDx=0; sbLocked=false; sbMode='';

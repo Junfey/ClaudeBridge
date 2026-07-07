@@ -331,12 +331,14 @@ async def cdp_tabs() -> dict:
         # "pending" = Claude is waiting for you (question / permission). Takes
         # priority over working/done — it needs an answer.
         pending = bool(t.get("pending"))
-        # "working" = the session file is actively growing (Claude is generating)
-        # and it isn't in a finished/done/waiting state.
+        # "working" = the session file was written recently (Claude is generating
+        # or running a tool) and it isn't finished/done/waiting. 40s (not 5s) so
+        # the "работает…" badge survives a long tool run (tests/installs) where the
+        # JSONL is quiet for a while; the done/pending icon clears it authoritatively.
         working = False
         if sf and not app_done and not pending:
             try:
-                working = (now - os.path.getmtime(sf) < 5) and not t.get("done")
+                working = (now - os.path.getmtime(sf) < 40) and not t.get("done")
             except OSError:
                 working = False
         out.append({"target_id": t["id"], "title": t["title"], "rendered": t["rendered"],
@@ -1209,6 +1211,18 @@ async def upload(files: list[UploadFile] = File(...)) -> dict:
                 out.write(chunk)
         saved.append({"name": base, "path": str(dest)})
     return {"files": saved}
+
+
+@app.get("/api/uploaded/{name}")
+def get_uploaded(name: str) -> FileResponse:
+    """Serve a file the phone previously uploaded, so images embedded in past
+    messages (referenced by their on-disk path) render as pictures on reload
+    instead of showing as a raw path. Basename only — no traversal."""
+    safe = os.path.basename(name)
+    dest = UPLOAD_DIR / safe
+    if safe != name or not dest.is_file():
+        raise HTTPException(404, "not found")
+    return FileResponse(dest)
 
 
 @app.get("/")

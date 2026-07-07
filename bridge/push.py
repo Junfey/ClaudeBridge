@@ -68,10 +68,12 @@ def _load_or_create_vapid() -> dict:
 
 _VAPID = _load_or_create_vapid()
 PUBLIC_KEY = _VAPID["public_key"]
-# VAPID subject. Apple's Web Push (Safari/iOS) REJECTS an invalid subject like
-# `mailto:...@localhost`; it requires a real mailto: or https: URL. An https URL
-# is accepted by every push service (FCM/Mozilla/Apple), so use the repo URL.
-_CLAIMS = {"sub": "https://github.com/Junfey/ClaudeBridge"}
+# VAPID subject. MUST be a `mailto:` link with a REAL domain:
+#  - py_vapid REJECTS a non-mailto sub outright ("Missing 'sub' ... as a mailto:
+#    link") — an https URL here silently broke ALL push (v1.0.3 regression).
+#  - Apple (Safari/iOS) rejects an invalid domain like `@localhost`.
+# github's noreply domain satisfies both.
+_CLAIMS = {"sub": "mailto:claudebridge@users.noreply.github.com"}
 
 # pywebpush needs a Vapid object (a PEM *string* is misread as a raw key and
 # fails to deserialize). Build it once from the stored PEM.

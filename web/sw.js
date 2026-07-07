@@ -39,7 +39,15 @@ self.addEventListener('push', (e) => {
   };
   // Action buttons (Chrome/Android only — Safari/iOS ignores `actions` safely).
   if (Array.isArray(data.actions) && data.actions.length) opts.actions = data.actions;
-  e.waitUntil(self.registration.showNotification(data.title, opts));
+  e.waitUntil((async () => {
+    await self.registration.showNotification(data.title, opts);
+    // App-icon count badge = number of pending notifications (unread chats).
+    try {
+      const ns = await self.registration.getNotifications();
+      const n = ns.filter(x => x.tag !== 'cb-ack').length || 1;
+      if (self.navigator.setAppBadge) await self.navigator.setAppBadge(n);
+    } catch (_) {}
+  })());
 });
 
 // Read the bridge auth key that the page stashed in the Cache (so the SW can
@@ -80,8 +88,10 @@ self.addEventListener('notificationclick', (e) => {
     return;
   }
   const url = nd.url || '/';
-  e.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(list => {
+  e.waitUntil((async () => {
+    try { if (self.navigator.clearAppBadge) await self.navigator.clearAppBadge(); } catch (_) {}
+    const list = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
     for (const c of list) { if ('focus' in c) { c.navigate(url); return c.focus(); } }
     if (self.clients.openWindow) return self.clients.openWindow(url);
-  }));
+  })());
 });
