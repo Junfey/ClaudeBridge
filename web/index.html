@@ -787,6 +787,13 @@ function connectCdpWs() {
     if (m.type === 'pong') { if(pongTimer){clearTimeout(pongTimer);pongTimer=null;} return; }
     { const cl=$('chatloading'); if(cl){ cl.remove(); clearTimeout(S.loadWatch); S.loadTries=0; } }  // first real message → drop the loader + disarm watchdog
     if (m.type === 'history') {
+      // Preserve the reader's position across the wipe+rebuild. History is re-sent
+      // on every (re)connect / visibility re-check; if the user had scrolled up to
+      // read, forcing to the bottom here yanked them down ("release → jumps to the
+      // end"). Follow to the end ONLY if they were already at the bottom; otherwise
+      // keep the same distance from the bottom (content is the same on a reconnect).
+      const atBottom = _stick;
+      const prevFromBottom = main.scrollHeight - main.scrollTop - main.clientHeight;
       chat.innerHTML = '';
       for (const msg of m.messages) {
         if (msg.role === 'tool') { const el=document.createElement('div'); el.className='tool'; el.textContent='🔧 '+msg.text; chat.appendChild(el); }
@@ -795,7 +802,8 @@ function connectCdpWs() {
       }
       renderOutboxPending(chat);  // show messages still queued for delivery
       if (S.card) addInteractive(chat, S.card);  // restore a still-pending question card
-      scrollDown(true);           // jump to the end on (re)load
+      if (atBottom) scrollDown(true);                     // was following → stay at the end
+      else main.scrollTop = Math.max(0, main.scrollHeight - main.clientHeight - prevFromBottom);
     } else if (m.type === 'sent') {
       // Delivery confirmed → drop from the queue and clear the "pending" mark.
       if (m.cid) { outboxRemove(m.cid); markBubble(m.cid, 'ok'); }
@@ -1111,11 +1119,18 @@ function setSending(on){ sendBtn.disabled=on; sendBtn.textContent=on?'…':'▶'
 // the bottom. If they scrolled up to read, live updates must NOT yank them down
 // (that was the "chat jumps to the end when I scroll a bit" bug). `force` (chat
 // open / send) always jumps to the end.
-let _stick=true;
-main.addEventListener('scroll', ()=>{
-  _stick = (main.scrollHeight - main.scrollTop - main.clientHeight) < 140;
-}, {passive:true});
-function scrollDown(force){ if(force || _stick) main.scrollTop=main.scrollHeight; }
+let _stick=true, _touchScroll=false;
+function recomputeStick(){ _stick = (main.scrollHeight - main.scrollTop - main.clientHeight) < 140; }
+main.addEventListener('scroll', recomputeStick, {passive:true});
+// While a finger is dragging the chat, NEVER auto-scroll. On some mobile browsers
+// scroll events are deferred until release, so a message streaming in mid-drag
+// would queue a jump that fires the instant you lift off ("scroll up, release →
+// snaps to the end"). Recompute stickiness from the final resting position on
+// release; momentum afterwards keeps it fresh via the scroll listener.
+main.addEventListener('touchstart', ()=>{ _touchScroll=true; }, {passive:true});
+main.addEventListener('touchend',   ()=>{ _touchScroll=false; recomputeStick(); }, {passive:true});
+main.addEventListener('touchcancel',()=>{ _touchScroll=false; recomputeStick(); }, {passive:true});
+function scrollDown(force){ if(force){ main.scrollTop=main.scrollHeight; return; } if(_stick && !_touchScroll) main.scrollTop=main.scrollHeight; }
 function esc(s){ return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function openLightbox(src){
   const lb=document.createElement('div'); lb.className='lightbox';
