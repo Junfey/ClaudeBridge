@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="theme-color" content="#0b0d10">
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="apple-touch-icon" href="/static/icon-192.png">
@@ -27,8 +27,12 @@
   /* The body itself must NEVER scroll or shift — only <main> scrolls vertically.
      Locking both axes here kills the "whole page slides / has H+V scrollbars"
      regression when a chat message is wider than the viewport. */
+  /* --app-h is set from the VisualViewport height when the on-screen keyboard
+     opens (see script) so the app clamps to the VISIBLE area and the header never
+     gets pushed off the top. Falls back to 100dvh (which interactive-widget=
+     resizes-content already shrinks on Chrome/Android). */
   body { display:flex; flex-direction:column; height:100vh; height:100dvh;
-    width:100%; overflow:hidden; }
+    height:var(--app-h, 100dvh); width:100%; overflow:hidden; }
   header { padding:12px 14px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:10px; background:var(--panel); }
   header .back { background:none; border:none; color:var(--accent); font-size:22px; cursor:pointer; padding:0 4px; display:none; }
   header h1 { font-size:16px; margin:0; flex:1; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -1322,6 +1326,25 @@ function sbSnap(){
   setTimeout(()=>{ document.body.style.transition=''; }, 250);
 }
 $('drawerBack').addEventListener('click', closeDrawer);
+// Keep the app clamped to the VISIBLE area when the on-screen keyboard opens, so
+// the top header is never pushed off-screen. interactive-widget=resizes-content
+// (viewport meta) already handles Chrome/Android — there the LAYOUT viewport
+// shrinks with the keyboard, so window.innerHeight ≈ visualViewport.height and we
+// leave 100dvh alone. iOS Safari ignores that directive (layout stays full, only
+// the VISUAL viewport shrinks), so there we override the height with the visual
+// viewport. Only a height var — never body.transform (the swipe-back owns that).
+if (window.visualViewport) {
+  const vv = window.visualViewport;
+  const fitVV = () => {
+    const kb = window.innerHeight - vv.height;   // keyboard overlap (0 when resized)
+    if (kb > 120) document.documentElement.style.setProperty('--app-h', Math.round(vv.height) + 'px');
+    else document.documentElement.style.removeProperty('--app-h');
+  };
+  vv.addEventListener('resize', fitVV);
+  vv.addEventListener('scroll', fitVV);
+  fitVV();
+}
+
 // Kill pinch-zoom / double-tap-zoom of the whole page (iOS ignores the viewport
 // user-scalable=no, so block the gestures directly).
 document.addEventListener('gesturestart', e=>e.preventDefault());
