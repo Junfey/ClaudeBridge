@@ -136,7 +136,7 @@
   footer.visible { display:flex; }
   .inputrow { display:flex; gap:8px; align-items:flex-end; }
   footer textarea { flex:1; background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:10px;
-    padding:10px; font:inherit; resize:none; min-height:44px; max-height:160px; }
+    padding:10px; font:inherit; resize:none; min-height:44px; max-height:180px; overflow-y:auto; line-height:1.4; }
   footer #send { background:var(--accent); color:#fff; border:none; border-radius:10px; padding:0 16px; font-weight:600; cursor:pointer; min-width:52px; height:44px; }
   footer #send:disabled { opacity:.5; cursor:not-allowed; }
   .iconbtn { background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:10px;
@@ -1104,7 +1104,7 @@ function startRecog(SR){
     // Take ONLY the last result — Android emits growing prefixes as separate
     // results, so the last one already holds the full current transcript.
     const last=e.results[e.results.length-1];
-    input.value = sessionBase + last[0].transcript;
+    input.value = sessionBase + last[0].transcript; autoGrow();
   };
   recog.onerror=ev=>{
     if(ev.error==='not-allowed'||ev.error==='service-not-allowed'){ manualStop=true; alert('Нет доступа к микрофону'); }
@@ -1183,7 +1183,7 @@ sendBtn.onclick=async ()=>{
   if(!queued){
     if(!S.ws || S.ws.readyState!==1){ alert('Нет связи с чатом — попробуй ещё раз.'); return; }
     S.ws.send(JSON.stringify({type:'send', text:finalText}));
-    input.value=''; attached=[]; renderChips();
+    input.value=''; attached=[]; renderChips(); autoGrow();
     if(chat){ if(text) addMsg(chat,'user',text); else if(paths.length) addMsg(chat,'user','📎 '+paths.length+' файл(ов)'); addImages(chat,imgPreviews); addThinking(); }
     return;
   }
@@ -1200,7 +1200,7 @@ sendBtn.onclick=async ()=>{
     addImages(chat, imgPreviews);
     addThinking();
   }
-  input.value=''; attached=[]; renderChips();
+  input.value=''; attached=[]; renderChips(); autoGrow();
   outboxAdd({cid, payload, ts:Date.now()});
   if(S.ws && S.ws.readyState===1){
     try{ S.ws.send(JSON.stringify(Object.assign({type:'send'}, payload, {cid}))); markBubble(cid,'pending'); }catch(e){ markBubble(cid,'undelivered'); }
@@ -1210,6 +1210,10 @@ sendBtn.onclick=async ()=>{
   }
 };
 input.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); sendBtn.click(); } });
+// Auto-grow the input with the text (multi-line, easy to read), capped by the
+// CSS max-height (180px) after which it scrolls.
+function autoGrow(){ input.style.height='auto'; input.style.height=Math.min(input.scrollHeight,180)+'px'; }
+input.addEventListener('input', autoGrow);
 
 // Swipe, anywhere on screen:
 //   In a chat  → (L→R) slides the tabs menu (drawer) OVER the chat; ← (R→L) hides it.
