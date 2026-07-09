@@ -279,7 +279,12 @@ async def _build_claude_tabs_uncached() -> list[dict]:
     # 1. Every Claude editor tab (rendered or not), identified by the extension's
     #    webview resource marker — NOT by title matching. This lists ALL Claude
     #    tabs regardless of count (6 or 60) or whether their session is recent.
-    for wt in await vscode_cdp.list_workbench_tabs():
+    wtabs = await vscode_cdp.list_workbench_tabs()
+    windows_seen: dict[str, str] = {}  # window name -> its workbench page ws_url
+    for wt in wtabs:
+        w = wt.get("window") or ""
+        if w and wt.get("page_ws_url") and w not in windows_seen:
+            windows_seen[w] = wt["page_ws_url"]
         if not wt.get("claude"):
             continue
         # Prefer the clean .tab-label text; fall back to (de-suffixed) aria.
@@ -329,6 +334,19 @@ async def _build_claude_tabs_uncached() -> list[dict]:
             if sf is not None and not target.get("session_file"):
                 target["session_file"] = str(sf)
 
+    # Surface open VS Code windows that have NO Claude tab yet as EMPTY projects,
+    # so a freshly-opened folder shows on the phone and you can start its first
+    # chat there ("+ Новая вкладка" → open_claude_in_window). Keyed "win:<name>"
+    # with the window's workbench page ws_url so new-tab can bootstrap it.
+    windows_with_claude = {e.get("window") for e in info.values() if e.get("window")}
+    for w, pw in windows_seen.items():
+        if w and w not in windows_with_claude:
+            info["win:" + w] = {
+                "id": "win:" + w, "title": "", "session_file": None, "ws_url": None,
+                "page_ws_url": pw, "aria": "", "window": w, "rendered": False,
+                "empty": True, "done": False, "pending": False,
+            }
+
     # Recover the session file for tabs we've already opened / sent to. Title
     # matching (above) misses when a tab's label doesn't match its JSONL ai-title
     # (truncated/renamed, or a brand-new chat whose title isn't indexed yet) — which
@@ -357,6 +375,11 @@ async def cdp_tabs() -> dict:
     out = []
     now = time.time()
     for t in tabs:
+        if t.get("empty"):   # an open window with no Claude tab yet — an empty project
+            out.append({"target_id": t["id"], "title": "", "window": t.get("window", ""),
+                        "rendered": False, "done": False, "working": False,
+                        "pending": False, "empty": True})
+            continue
         sf = t.get("session_file")
         # VS Code says this tab is "done/unread". Suppress it once the phone has
         # seen it: you're watching it now, or nothing new arrived since you read.
@@ -923,16 +946,24 @@ class NewTabReq(BaseModel):
 @app.post("/api/cdp/new-tab")
 async def cdp_new_tab(req: NewTabReq) -> dict:
     """Start a new Claude chat in a given VS Code window (project)."""
-    # Prefer a rendered tab in that window (no activation needed).
+    await _build_claude_tabs(force=True)  # current view of windows/tabs
+    # Prefer a rendered Claude tab in that window (no activation needed).
     for info in CDP_TABS_INFO.values():
-        if info.get("window") == req.window and info.get("ws_url"):
+        if info.get("window") == req.window and not info.get("empty") and info.get("ws_url"):
             return await vscode_cdp.click_new_session(info["ws_url"])
-    # Else activate any tab in that window, then start a new session.
+    # Else activate any Claude tab in that window, then start a new session.
     for uid, info in list(CDP_TABS_INFO.items()):
-        if info.get("window") == req.window:
+        if info.get("window") == req.window and not info.get("empty"):
             ws_url, _ = await _ensure_rendered(uid)
             if ws_url:
                 return await vscode_cdp.click_new_session(ws_url)
+    # No Claude tab in that window (a freshly-opened project) → open the FIRST chat
+    # via the workbench "Claude Code: Open" action on the window's page.
+    for info in CDP_TABS_INFO.values():
+        if info.get("window") == req.window and info.get("page_ws_url"):
+            res = await vscode_cdp.open_claude_in_window(info["page_ws_url"])
+            if res.get("ok"):
+                return res
     raise HTTPException(404, "no tab in that window")
 
 

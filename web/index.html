@@ -402,18 +402,20 @@ function tabsListHTML(){
     S.cdpTabs.forEach((t,i) => { const w = t.window || 'VS Code'; (groups[w] = groups[w] || []).push(i); });
     for (const win of Object.keys(groups)) {
       const isCol = !!S.collapsed[win];
-      const doneN = groups[win].filter(i => S.cdpTabs[i].done).length;
-      const pendN = groups[win].filter(i => S.cdpTabs[i].pending).length;
+      const real = groups[win].filter(i => !S.cdpTabs[i].empty);   // drop empty-project markers
+      const doneN = real.filter(i => S.cdpTabs[i].done).length;
+      const pendN = real.filter(i => S.cdpTabs[i].pending).length;
       html += `<div class="proj-head" data-proj="${esc(win)}">
                  <span class="chev">${isCol?'▶':'▼'}</span>
                  <span class="proj-name">${esc(win)}</span>
                  ${pendN?`<span class="pending-count">${pendN} ❓</span>`:''}
                  ${doneN?`<span class="done-count">${doneN} готово</span>`:''}
-                 <span class="proj-count">${groups[win].length}</span>
+                 <span class="proj-count">${real.length||'+'}</span>
                </div>`;
       if (!isCol) {
         html += `<div class="new-tab" data-newtab="${esc(win)}">＋ Новая вкладка в проекте</div>`;
-        html += groups[win].map(i => {
+        if (!real.length) html += `<div class="meta" style="padding:2px 14px 12px 34px">проект открыт, чатов пока нет — нажми «Новая вкладка», чтобы начать</div>`;
+        html += real.map(i => {
           const t = S.cdpTabs[i];
           const act = t.target_id===S.activeTab ? ' active-chat' : '';
           const state = t.pending ? ' is-pending' : (t.working ? ' is-working' : (t.done ? ' is-done' : ''));
@@ -510,14 +512,20 @@ function showTabMenu(tab){
       <div class="menu-item cancel" data-act="cancel">Отмена</div>
     </div>`;
   document.body.appendChild(ov);
-  // The long-press that opened this menu emits a trailing "ghost" click on
-  // release — which lands on the overlay (now under the finger). Ignore any
-  // interaction for the first 450ms so the menu doesn't close/act on release.
-  const openAt = Date.now();
-  const fresh = () => Date.now() - openAt < 450;
-  ov.addEventListener('click', (e) => { if(fresh()) return; if(e.target===ov) closeTabMenu(); });
+  // The long-press that opened this menu is a touch that STARTED on the tab, not
+  // on this overlay — its release fires a trailing "ghost" click on the overlay
+  // that used to close the menu the instant you lifted your finger (a time-based
+  // guard failed when you held long enough to read the menu first). Fix: only act
+  // on interactions that BEGIN on the overlay (a real, separate tap) — arm on the
+  // overlay's own touchstart/pointerdown, so the opening touch's release never
+  // counts (it never fires a touchstart on the overlay).
+  let armed = false;
+  const arm = () => { armed = true; };
+  ov.addEventListener('touchstart', arm, {passive:true});
+  ov.addEventListener('pointerdown', arm);
+  ov.addEventListener('click', (e) => { if(armed && e.target===ov) closeTabMenu(); });
   ov.querySelectorAll('[data-act]').forEach(it => it.onclick = async () => {
-    if(fresh()) return;
+    if(!armed) return;
     const act = it.dataset.act;
     closeTabMenu();
     if(act==='cancel') return;

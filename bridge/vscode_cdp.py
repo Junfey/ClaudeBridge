@@ -824,6 +824,41 @@ async def click_new_session(ws_url: str) -> dict:
             return res or {"ok": False}
 
 
+async def open_claude_in_window(page_ws_url: str) -> dict:
+    """Open a NEW Claude chat in a VS Code window that has NO Claude tab yet, by
+    invoking the workbench 'Claude Code: Open' action — this creates a
+    webview-claudeVSCodePanel editor tab (verified against the live workbench).
+    Bootstraps the first chat in a freshly-opened project from the phone. Two-step
+    and idempotent: reveal the Claude view (so its 'Open' action is in the DOM),
+    then click it."""
+    reveal = (r"""(() => { const a=[...document.querySelectorAll('.activitybar [aria-label]')]"""
+              r""".find(e=>/^Claude Code/.test((e.getAttribute('aria-label')||'').trim()));"""
+              r""" if(!a) return false; ['mousedown','mouseup','click'].forEach(t=>"""
+              r"""a.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window}))); return true; })()""")
+    openit = (r"""(() => { const a=[...document.querySelectorAll('[aria-label]')]"""
+              r""".find(e=>(e.getAttribute('aria-label')||'').trim()==='Claude Code: Open');"""
+              r""" if(!a) return false; ['mousedown','mouseup','click'].forEach(t=>"""
+              r"""a.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window}))); return true; })()""")
+    async with websockets.connect(page_ws_url, max_size=30_000_000) as ws:
+        async with _CDPConn(ws) as conn:
+            await conn.call("Runtime.enable")
+            await asyncio.sleep(0.2)
+
+            async def try_all(js):
+                for c in conn.collect_contexts():
+                    try:
+                        if await conn.eval_in(c["id"], js):
+                            return True
+                    except Exception:
+                        continue
+                return False
+
+            await try_all(reveal)       # reveal the Claude view (harmless if already open)
+            await asyncio.sleep(0.8)
+            ok = await try_all(openit)  # create the chat editor tab
+            return {"ok": bool(ok)} if ok else {"ok": False, "error": "Claude Code: Open not found"}
+
+
 async def read_transcript(ws_url: str, max_messages: int = 40) -> dict:
     """Scrape the visible chat transcript from the webview DOM."""
     async with websockets.connect(ws_url, max_size=30_000_000) as ws:
