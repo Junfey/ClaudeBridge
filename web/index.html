@@ -232,6 +232,16 @@
   .modebtn { background:var(--bg); border:1px solid var(--line); color:var(--fg); border-radius:8px;
     padding:5px 9px; font-size:12px; cursor:pointer; white-space:nowrap; max-width:120px; overflow:hidden; text-overflow:ellipsis; }
   .modebtn:active { background:var(--panel); }
+  /* optimistic "opening…" rows for a project/tab being created (resolve when the
+     real thing appears in the poll). */
+  .pending-proj { display:flex; align-items:center; gap:10px; padding:13px 14px;
+    background:var(--panel); border-top:1px solid var(--line); border-bottom:1px solid var(--line);
+    color:var(--fg); font-weight:600; }
+  .pending-proj .st { margin-left:auto; color:var(--muted); font-weight:400; font-size:13px; }
+  .pending-row { display:flex; align-items:center; gap:10px; padding:13px 14px 13px 34px;
+    border-bottom:1px solid var(--line); background:rgba(217,119,87,.07); color:var(--fg); }
+  .pending-row .st { margin-left:auto; color:var(--muted); font-size:13px; }
+  .pending-proj .spin, .pending-row .spin { border-color:var(--accent); border-top-color:transparent; }
   #updbar { display:none; position:fixed; left:50%; transform:translateX(-50%);
     bottom:calc(env(safe-area-inset-bottom,0px) + 96px); z-index:9998; background:var(--accent);
     color:#111; font-size:13px; font-weight:600; padding:9px 16px; border-radius:20px;
@@ -334,6 +344,7 @@ async function loadHome() {
     S.cdpTabs = (r && r.tabs) || [];
     S.cdpOk = r ? (r.cdp !== false) : true;
     setStatus(true);
+    reconcilePending();  // clear "открывается…" rows whose real project/tab now exists
     updateAppBadge();   // keep the icon badge in sync with unread готово/вопрос tabs
     if (S.pendingOpen) {
       const t = S.cdpTabs.find(x => x.target_id === S.pendingOpen);
@@ -344,6 +355,39 @@ async function loadHome() {
     else if (S.drawerOpen) renderDrawer();   // keep the open drawer fresh (done marks)
   } catch(e) { setStatus(false); }
   finally { S.loadingHome = false; }
+}
+
+// ── optimistic "открывается…" progress for opening a project / making a tab ──
+// A newly opened VS Code window (or new Claude tab) takes seconds to appear in
+// the poll; show a placeholder row immediately so it's obviously happening, and
+// clear it once the real project/tab shows up (or after a timeout).
+function reconcilePending(){
+  S.pendingProjects = S.pendingProjects || {};
+  S.pendingTabs = S.pendingTabs || {};
+  const now = Date.now();
+  for (const name in S.pendingProjects){
+    // resolved once a VS Code window with that project name appears, or timed out
+    if (S.cdpTabs.some(t => t.window === name) || now - S.pendingProjects[name].at > 90000)
+      delete S.pendingProjects[name];
+  }
+  for (const win in S.pendingTabs){
+    const p = S.pendingTabs[win];
+    const cur = S.cdpTabs.filter(t => t.window === win && !t.empty).length;
+    if (cur > p.baseline){ p.count -= (cur - p.baseline); p.baseline = cur; }  // a real tab appeared
+    if (p.count <= 0 || now - p.at > 90000) delete S.pendingTabs[win];
+  }
+}
+function anyPending(){
+  return Object.keys(S.pendingProjects||{}).length || Object.keys(S.pendingTabs||{}).length;
+}
+// While something is opening, poll faster (1.2s) so the placeholder resolves
+// promptly; stop once everything has appeared.
+function bumpPolling(){
+  if (S._fastPoll) return;
+  S._fastPoll = setInterval(() => {
+    if (!anyPending()){ clearInterval(S._fastPoll); S._fastPoll = null; return; }
+    loadHome();
+  }, 1200);
 }
 
 let _offTimer=null, _wasOffline=false, _everOnline=false, _recoverTimer=null;
@@ -397,6 +441,9 @@ function renderHome() {
 function tabsListHTML(){
   S.collapsed = S.collapsed || {};
   let html = '<div class="new-btn" data-openproj="1">📁 Открыть / создать проект</div>';
+  // projects being opened whose VS Code window hasn't shown up yet
+  for (const name in (S.pendingProjects||{}))
+    html += `<div class="pending-proj"><span class="spin"></span><span>${esc(name)}</span><span class="st">открывается…</span></div>`;
   if (S.cdpTabs.length) {
     const groups = {};
     S.cdpTabs.forEach((t,i) => { const w = t.window || 'VS Code'; (groups[w] = groups[w] || []).push(i); });
@@ -432,6 +479,10 @@ function tabsListHTML(){
              <div class="meta">${meta}</div>
            </div>`;
         }).join('');
+        // new tabs being created in this project (cleared when the real tab shows)
+        const pt = (S.pendingTabs||{})[win];
+        if (pt && pt.count>0) for (let k=0;k<pt.count;k++)
+          html += `<div class="pending-row"><span class="spin"></span><span>Новая вкладка</span><span class="st">открывается…</span></div>`;
       }
     }
   } else if (S.cdpOk === false) {
@@ -564,27 +615,37 @@ async function openProjects(path) {
     if($('createhere')) $('createhere').onclick=()=>createProject(r.path);
   } catch(e){ main.innerHTML=`<div class="empty">Ошибка: ${esc(e.message)}</div>`; }
 }
+function baseName(path){ return path.replace(/[\\\/]+$/,'').split(/[\\\/]/).pop() || path; }
+function rerenderTabs(){ if(S.view==='home') renderHome(); else renderDrawer(); }
 async function openProjectPath(path){
-  try{ await api('/api/project/open',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({path})});
-    alert('Открываю в VS Code…'); setTimeout(()=>{ renderHome(); loadHome(); }, 2500);
-  }catch(e){ alert('Ошибка: '+e.message); }
+  const name = baseName(path);
+  S.pendingProjects = S.pendingProjects || {}; S.pendingProjects[name] = { at: Date.now() };
+  renderHome(); bumpPolling();   // show "<name> · открывается…" immediately
+  try{ await api('/api/project/open',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({path})}); }
+  catch(e){ delete S.pendingProjects[name]; renderHome(); alert('Ошибка: '+e.message); }
 }
 async function createProject(parent){
   const name=(prompt('Имя новой папки/проекта:')||'').trim();
   if(!name) return;
-  try{ const r=await api('/api/project/create',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({parent,name})});
-    alert('Создано и открываю: '+r.path); setTimeout(()=>{ renderHome(); loadHome(); }, 2500);
-  }catch(e){ alert('Ошибка: '+e.message); }
+  S.pendingProjects = S.pendingProjects || {}; S.pendingProjects[name] = { at: Date.now() };
+  renderHome(); bumpPolling();
+  try{ await api('/api/project/create',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({parent,name})}); }
+  catch(e){ delete S.pendingProjects[name]; renderHome(); alert('Ошибка: '+e.message); }
 }
 async function newTabInProject(win, el){
-  if(el){ if(el.dataset.busy) return; el.dataset.busy='1'; el.classList.add('busy');
-    el.innerHTML = 'Создаётся, подождите…<span class="spin"></span>'; }
+  if(el){ if(el.dataset.busy) return; el.dataset.busy='1'; }   // guard double-tap
+  S.pendingTabs = S.pendingTabs || {};
+  const baseline = S.cdpTabs.filter(t=>t.window===win && !t.empty).length;
+  const p = S.pendingTabs[win] || { count:0, baseline, at:Date.now() };
+  p.count += 1; p.baseline = Math.min(p.baseline, baseline); p.at = Date.now();
+  S.pendingTabs[win] = p;
+  rerenderTabs();   // show a "Новая вкладка · открывается…" placeholder row at once
+  bumpPolling();
   try{
     await api('/api/cdp/new-tab',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({window:win})});
-    setTimeout(loadHome, 2500);  // re-render replaces the button, clearing the spinner
   }catch(e){
-    if(el){ el.dataset.busy=''; el.classList.remove('busy'); el.textContent='＋ Новая вкладка в проекте'; }
-    alert('Ошибка: '+e.message);
+    p.count -= 1; if(p.count<=0) delete S.pendingTabs[win];
+    rerenderTabs(); alert('Ошибка: '+e.message);
   }
 }
 
