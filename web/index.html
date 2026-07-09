@@ -315,6 +315,8 @@ async function api(path, opts) {
 function wsKey(){ return S.key ? ('?key=' + encodeURIComponent(S.key)) : ''; }
 
 async function loadHome() {
+  if (S.loadingHome) return;   // a poll is still in flight — don't stack another
+  S.loadingHome = true;        // (a slow /api/cdp/tabs must not pile up every 3s)
   try {
     const r = await api('/api/cdp/tabs');
     S.cdpTabs = (r && r.tabs) || [];
@@ -328,6 +330,7 @@ async function loadHome() {
     if (S.view === 'home') renderHome();
     else if (S.drawerOpen) renderDrawer();   // keep the open drawer fresh (done marks)
   } catch(e) { setStatus(false); }
+  finally { S.loadingHome = false; }
 }
 
 let _offTimer=null, _wasOffline=false, _everOnline=false, _recoverTimer=null;
@@ -587,7 +590,12 @@ function openCdpTab(tab) {
   modeBtn.style.display='inline-block';
   modeBtn.textContent='⚙ …';
   modeBtn.onclick=()=>showModeSheet();
-  loadMode();
+  // Defer the mode HTTP fetch so it doesn't compete with the history load for a
+  // scarce tunnel connection during the critical open window (loca.lt gives only
+  // ~2 concurrent connections). Mode rarely changes; a ~2s delay is invisible.
+  clearTimeout(S.modeTimer);
+  S.modeTimer=setTimeout(()=>{ if(S.view==='cdpchat' && S.cdpTarget===tab.target_id) loadMode(); }, 2000);
+  S.loadTries=0; clearTimeout(S.loadWatch);   // reset the loader watchdog for a fresh open
   connectCdpWs();
 }
 
@@ -722,6 +730,15 @@ async function showModelSheet(){
   });
 }
 
+// When the chat can't load after several reconnects (frames not routing through
+// the tunnel), stop the silent spinner and give the user an explicit retry.
+function showLoaderRetry(){
+  const cl=$('chatloading'); if(!cl) return;
+  cl.style.cursor='pointer';
+  cl.textContent='⚠ чат не загрузился — нажми, чтобы повторить';
+  cl.onclick=()=>{ cl.onclick=null; cl.style.cursor=''; cl.innerHTML='<span class="spin"></span>загружаю чат…'; S.loadTries=0; connectCdpWs(); };
+}
+
 function connectCdpWs() {
   closeWs();
   const chat = $('chat');
@@ -729,6 +746,21 @@ function connectCdpWs() {
   const proto = location.protocol==='https:'?'wss':'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws/cdp/${S.cdpTarget}${wsKey()}`);
   S.ws = ws;
+  // Loader watchdog: if the first history frame never arrives — e.g. the tunnel
+  // dropped it under connection starvation — the "загружаю чат…" spinner would
+  // hang forever while the socket still looks "online". If the loader is still up
+  // 14s after (re)connecting (longer than the server's 12s open timeout, so a
+  // legitimately slow tab isn't cut off), force a reconnect; after a few tries,
+  // show a tap-to-retry so the user is never stuck on a dead spinner.
+  if ($('chatloading')) {
+    clearTimeout(S.loadWatch);
+    S.loadWatch = setTimeout(() => {
+      if (!$('chatloading')) return;                         // history arrived → fine
+      S.loadTries = (S.loadTries||0) + 1;
+      if (S.loadTries < 3) { try{ ws.close(); }catch(e){} }  // onclose → reconnect
+      else showLoaderRetry();
+    }, 14000);
+  }
   // Heartbeat: ping every 20s; if no pong within 15s the connection is half-dead,
   // so force-close it → onclose reconnects. 15s (not 8s) so a transient CPU/
   // network spike — e.g. a fullscreen game hogging the uplink / Windows Game Mode
@@ -753,7 +785,7 @@ function connectCdpWs() {
   ws.onmessage = ev => {
     const m = JSON.parse(ev.data);
     if (m.type === 'pong') { if(pongTimer){clearTimeout(pongTimer);pongTimer=null;} return; }
-    { const cl=$('chatloading'); if(cl) cl.remove(); }  // first real message → drop the loader
+    { const cl=$('chatloading'); if(cl){ cl.remove(); clearTimeout(S.loadWatch); S.loadTries=0; } }  // first real message → drop the loader + disarm watchdog
     if (m.type === 'history') {
       chat.innerHTML = '';
       for (const msg of m.messages) {

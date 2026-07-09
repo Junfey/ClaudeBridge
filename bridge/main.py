@@ -57,6 +57,15 @@ _CDP_LOCKS: dict[str, "asyncio.Lock"] = {}
 # resend a queued message after a dropped tunnel WITHOUT double-submitting it:
 # a resend with a known cid is just re-acked, not re-injected.
 CDP_SEEN_CIDS: dict[str, list] = {}
+# Single-flight + short TTL cache for the tab list. Building it hits VS Code over
+# CDP (~9 concurrent title reads) and is polled every 3s AND on every chat-open;
+# without this, N concurrent callers each ran a full build → the executor thread
+# pool saturated and every request took many seconds (and stalled the mirror /
+# heartbeats). Now concurrent callers share ONE in-flight build and reuse a
+# <TTL-old result — collapsing a burst of calls into a single CDP round-trip.
+_TABS_CACHE: dict = {"at": 0.0, "data": None}
+_TABS_TTL = 1.5  # seconds a built tab list stays fresh
+_tabs_lock: "asyncio.Lock | None" = None
 
 
 def _cid_is_seen(target_id: str, cid: str | None) -> bool:
@@ -230,11 +239,32 @@ def cdp_available() -> dict:
     return {"available": vscode_cdp.cdp_available()}
 
 
-async def _build_claude_tabs() -> list[dict]:
+async def _build_claude_tabs(force: bool = False) -> list[dict]:
+    """Tab list with single-flight + short-TTL caching (see _TABS_CACHE). Concurrent
+    callers share one build; a <TTL-old result is reused. `force=True` bypasses the
+    cache (used when we must find a tab that isn't in it yet, e.g. _ensure_rendered)."""
+    global _tabs_lock
+    if _tabs_lock is None:
+        _tabs_lock = asyncio.Lock()
+    now = time.monotonic()
+    if not force and _TABS_CACHE["data"] is not None and (now - _TABS_CACHE["at"]) < _TABS_TTL:
+        return _TABS_CACHE["data"]
+    async with _tabs_lock:
+        # Someone may have refreshed it while we waited for the lock.
+        now = time.monotonic()
+        if not force and _TABS_CACHE["data"] is not None and (now - _TABS_CACHE["at"]) < _TABS_TTL:
+            return _TABS_CACHE["data"]
+        data = await _build_claude_tabs_uncached()
+        _TABS_CACHE["at"] = time.monotonic()
+        _TABS_CACHE["data"] = data
+        return data
+
+
+async def _build_claude_tabs_uncached() -> list[dict]:
     """Unified list of ALL open Claude tabs across windows — rendered or not.
     Identity = session uuid (JSONL stem). Rendered tabs get a ws_url for inject;
     sleeping tabs carry their window + label so we can activate them on demand."""
-    index = claude_storage.build_title_index()
+    index = await _off(claude_storage.build_title_index)
     info: dict[str, dict] = {}
 
     def _norm(s: str) -> str:
@@ -352,7 +382,7 @@ async def _ensure_rendered(uid: str) -> tuple[str | None, str | None]:
     if it's a sleeping tab so CDP can attach to its webview."""
     info = CDP_TABS_INFO.get(uid)
     if not info:
-        await _build_claude_tabs()
+        await _build_claude_tabs(force=True)  # fresh: the tab may have just appeared
         info = CDP_TABS_INFO.get(uid)
     if not info:
         return None, None
@@ -901,7 +931,7 @@ async def cdp_close_tab(req: CloseTabReq) -> dict:
     """Close a Claude tab (or all others in its window) from the phone."""
     info = CDP_TABS_INFO.get(req.target_id)
     if not info:
-        await _build_claude_tabs()
+        await _build_claude_tabs(force=True)  # must find this exact tab
         info = CDP_TABS_INFO.get(req.target_id)
     if not info or not info.get("page_ws_url"):
         raise HTTPException(404, "tab not found")
@@ -917,7 +947,7 @@ async def cdp_close_tab(req: CloseTabReq) -> dict:
     else:
         targets = [{"panel": info.get("panel"), "aria": info.get("aria")}]
     n = await vscode_cdp.close_tabs(page_ws, targets)
-    await _build_claude_tabs()  # refresh the cached list
+    await _build_claude_tabs(force=True)  # refresh so the closed tab drops out at once
     return {"ok": n > 0, "closed": n}
 
 
@@ -1020,6 +1050,17 @@ async def cdp_answer_push(req: AnswerPushReq) -> dict:
 # ── Web Push ────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def _start_push_watcher() -> None:
+    # Roomy thread pool: every CDP HTTP call and JSONL read runs via
+    # run_in_executor, and a burst (chat-open + the 3s tabs poll + the pending
+    # watcher) can exhaust the small default pool → requests queue for seconds and
+    # the mirror / heartbeats stall (felt as "chat won't load" + dropped links).
+    # These tasks are I/O-bound and mostly idle, so a generous count is cheap.
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        asyncio.get_running_loop().set_default_executor(
+            ThreadPoolExecutor(max_workers=48, thread_name_prefix="cb-io"))
+    except Exception:
+        pass
     asyncio.create_task(push.watcher())
     asyncio.create_task(_pending_watcher())
     asyncio.create_task(_startup_online_push())

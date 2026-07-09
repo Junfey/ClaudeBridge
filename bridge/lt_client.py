@@ -171,7 +171,16 @@ async def run_tunnel(local_port: int = 8765, server: str = "https://loca.lt",
 
         health = {"opening": 0, "idle": 0, "est": 0, "empty": 0, "served": 0}
         tasks: set = set()
-        cap = max(conns * 4, 12)  # hard ceiling on total connections
+        # Keep a healthy IDLE BUFFER, not just max_conn_count. loca.lt hands out
+        # max_conn_count=2, but a phone opening a chat fires several near-parallel
+        # requests (the long-lived mirror WebSocket + history + mode/controls) and
+        # each in-flight request consumes a whole tunnel connection. With only 2,
+        # the mirror WS holds one for its entire life and a single extra request
+        # saturates the tunnel → the phone's history frame never routes → the chat
+        # hangs on "загружаю чат…". loca.lt accepts more than max_conn_count, so we
+        # keep a pool of spare idle connections ready to absorb the burst.
+        ready_target = min(8, max(conns, 5))
+        cap = max(conns * 6, 18)  # hard ceiling on total connections
 
         def spawn() -> None:
             health["opening"] += 1
@@ -184,20 +193,20 @@ async def run_tunnel(local_port: int = 8765, server: str = "https://loca.lt",
         next_reclaim = time.monotonic() + 25
         try:
             while True:
-                # Keep `conns` connections READY (idle/connecting); each one that
-                # starts serving a request gets replaced, so a long-lived
-                # WebSocket never starves the pool. Churn guard: if loca.lt keeps
-                # accepting-then-closing connections with no request (health.empty
-                # climbing), don't hammer it in a tight loop.
                 churn = health["empty"]
-                if churn < 3:
-                    while (health["idle"] + health["opening"]) < conns and len(tasks) < cap:
-                        spawn()  # healthy: fill the pool fast
-                    await asyncio.sleep(0.5)
-                else:
-                    if (health["idle"] + health["opening"]) < conns and len(tasks) < cap:
-                        spawn()  # churning: one at a time, backed off
-                    await asyncio.sleep(min(5.0, 0.5 * churn))
+                # Healthy: keep `ready_target` idle connections on hand and refill
+                # fast (0.15s) so the buffer is topped up the instant the mirror WS
+                # or a request consumes one. Churning (loca.lt accepts-then-closes
+                # with no request): still keep at least `conns` idle so the user
+                # isn't starved, but add one per cycle with a backoff so we don't
+                # hammer a bad tunnel. (Threshold 6, not 3 — a few stray empties are
+                # normal and shouldn't drop us into starvation mode.)
+                target = ready_target if churn < 6 else conns
+                while (health["idle"] + health["opening"]) < target and len(tasks) < cap:
+                    spawn()
+                    if churn >= 6:
+                        break
+                await asyncio.sleep(0.15 if churn < 6 else min(3.0, 0.4 * churn))
                 # Dead-port: no connection established for ~20s → refresh tunnel.
                 if health["est"] > 0:
                     zero_since = None
