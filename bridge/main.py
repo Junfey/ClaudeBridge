@@ -328,6 +328,17 @@ async def _build_claude_tabs_uncached() -> list[dict]:
             if sf is not None and not target.get("session_file"):
                 target["session_file"] = str(sf)
 
+    # Recover the session file for tabs we've already opened / sent to. Title
+    # matching (above) misses when a tab's label doesn't match its JSONL ai-title
+    # (truncated/renamed, or a brand-new chat whose title isn't indexed yet) — which
+    # left an actively-working tab with no session_file, so its "работает" status
+    # could never be computed. CDP_SESSION is keyed by the same uid we build here
+    # and is learned from a real open/send/mirror, so it's authoritative.
+    for uid, e in info.items():
+        if not e.get("session_file"):
+            sess = CDP_SESSION.get(uid)
+            if sess and os.path.exists(sess):
+                e["session_file"] = sess
     for e in info.values():
         e.pop("_norm", None)
     CDP_TABS_INFO.clear()
