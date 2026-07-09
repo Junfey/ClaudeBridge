@@ -232,6 +232,10 @@
   .modebtn { background:var(--bg); border:1px solid var(--line); color:var(--fg); border-radius:8px;
     padding:5px 9px; font-size:12px; cursor:pointer; white-space:nowrap; max-width:120px; overflow:hidden; text-overflow:ellipsis; }
   .modebtn:active { background:var(--panel); }
+  #updbar { display:none; position:fixed; left:50%; transform:translateX(-50%);
+    bottom:calc(env(safe-area-inset-bottom,0px) + 96px); z-index:9998; background:var(--accent);
+    color:#111; font-size:13px; font-weight:600; padding:9px 16px; border-radius:20px;
+    box-shadow:0 6px 20px rgba(0,0,0,.45); cursor:pointer; max-width:92%; text-align:center; }
 </style>
 </head>
 <body>
@@ -273,6 +277,10 @@ newsessBtn.onclick=()=>{
 };
 
 let S = { view:'home', windows:[], cdpTabs:[], currentTitle:'', ws:null, key:'', activeTab:'' };
+// Build version baked into this HTML by the server (see index()). Compared against
+// /api/version so the app can offer a reload — a standalone PWA has no
+// pull-to-refresh, so this is the ONLY way to pick up a new client build.
+const CLIENT_VERSION = '__CB_VERSION__';
 
 // Auth token: from ?key= (QR link) or saved; else prompt once.
 // ?open=<target_id> (from a push tap) deep-links straight to that chat.
@@ -637,6 +645,7 @@ function showModeSheet(){
     <div class="menu-item nohover"><div class="mi-wrap" style="width:100%"><div>⚡ Effort (усилие) <span id="effname" class="ctrl-state"></span></div><div class="eff-dots" id="effdots"><span class="mi-desc">…</span></div></div></div>
     <div class="menu-item" data-act="thinking"><div class="mi-wrap"><div>🧠 Thinking <span id="thinkval" class="ctrl-state">…</span></div><div class="mi-desc">размышления перед ответом</div></div></div>
     ${(function(){const on=pushIsOn();return `<div class="menu-item${on?' sel':''}" data-act="push"><div class="mi-wrap"><div>🔔 Уведомления · ${on?'вкл':'выкл'}</div><div class="mi-desc">${on?'нажми, чтобы выключить':'нажми, чтобы включить (пуш когда Claude ответил)'}</div></div></div>`;})()}
+    <div class="menu-item" data-act="update"><div class="mi-wrap"><div>🔄 Обновить приложение${_updateReady?' · есть новая!':''}</div><div class="mi-desc">версия ${esc(CLIENT_VERSION)} · перезагрузить и подтянуть свежую</div></div></div>
     <div class="menu-item cancel" data-act="cancel">Отмена</div></div>`;
   document.body.appendChild(ov);
   const openAt=Date.now(); const fresh=()=>Date.now()-openAt<450;
@@ -659,6 +668,7 @@ function showModeSheet(){
     if(act==='cancel'){ closeTabMenu(); return; }
     if(act==='model'){ showModelSheet(); return; }
     if(act==='push'){ closeTabMenu(); togglePush(); return; }
+    if(act==='update'){ closeTabMenu(); doAppUpdate(); return; }
     if(act==='thinking'){
       const tv=$('thinkval'); if(tv) tv.textContent='…';
       try{ const r=await api('/api/cdp/thinking',{method:'POST',headers:{'content-type':'application/json'},
@@ -1500,10 +1510,39 @@ function closeChatNotif(targetId){
       .then(reg=>reg.getNotifications({tag:targetId}).then(ns=>ns.forEach(n=>n.close()))).catch(()=>{});
   }catch(e){}
 }
+
+// ── in-app updater (a standalone PWA has no pull-to-refresh) ─────────
+let _updateReady = false;
+async function checkUpdate(){
+  // If the placeholder wasn't substituted (opened outside the bridge), skip.
+  if(CLIENT_VERSION.indexOf('CB_VERSION')>=0 || _updateReady) return;
+  try{
+    const r = await api('/api/version');
+    if(r && r.version && r.version !== CLIENT_VERSION){ _updateReady = true; showUpdateBar(r.version); }
+  }catch(e){}
+}
+function showUpdateBar(v){
+  let b=$('updbar');
+  if(!b){ b=document.createElement('div'); b.id='updbar'; document.body.appendChild(b); b.onclick=doAppUpdate; }
+  b.innerHTML='🔄 Обновление '+esc(v)+' готово · <b>нажми, чтобы обновить</b>';
+  b.style.display='block';
+}
+async function doAppUpdate(){
+  const b=$('updbar'); if(b) b.innerHTML='обновляю…';
+  try{
+    if(navigator.serviceWorker){
+      const regs = await navigator.serviceWorker.getRegistrations();
+      for(const r of regs){ try{ await r.update(); }catch(e){} }   // pull the new sw.js
+    }
+  }catch(e){}
+  // index.html is network-first in the SW, so a plain reload fetches fresh code.
+  location.reload();
+}
 document.addEventListener('visibilitychange', ()=>{
   if(document.hidden) return;
   clearBadges();
   loadHome();   // refresh the tab list so the badge reflects the CURRENT unread state
+  checkUpdate();   // a new build may have shipped while we were backgrounded
   // Mobile freezes timers while backgrounded, so the heartbeat can't detect a
   // dead socket. On return, verify liveness immediately: reconnect now if the
   // socket is gone, else ping to force a fast drop-check.
@@ -1553,7 +1592,9 @@ autoPush();
 initTableFs();
 clearBadges();
 cacheKeyForSW();
+checkUpdate();
 setInterval(()=>{ if(S.view==='home' || S.drawerOpen) loadHome(); }, 3000);
+setInterval(checkUpdate, 60000);   // catch a new build within a minute
 </script>
 </body>
 </html>

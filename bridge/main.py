@@ -12,7 +12,7 @@ import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -28,6 +28,7 @@ from . import jsonl_watch
 from . import claude_storage
 from . import auth
 from . import push
+from . import version
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -1284,8 +1285,17 @@ def get_uploaded(name: str) -> FileResponse:
 
 
 @app.get("/")
-def index() -> FileResponse:
-    return FileResponse(WEB_DIR / "index.html")
+def index() -> HTMLResponse:
+    # Inject the running build version into the shell so the client knows which
+    # version it's actually running (there's no pull-to-refresh in a standalone
+    # PWA, so the client compares this against /api/version and offers a reload).
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    return HTMLResponse(html.replace("__CB_VERSION__", version.VERSION))
+
+
+@app.get("/api/version")
+def api_version() -> dict:
+    return {"version": version.VERSION}
 
 
 app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
