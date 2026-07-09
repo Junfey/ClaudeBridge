@@ -103,6 +103,33 @@
     white-space:pre; color:var(--fg); }
   .md-hr { border:none; border-top:1px solid var(--line); margin:12px 0; }
   .md-p a, .md-li a { color:var(--tool); }
+  /* GFM tables: a real grid. The wrap scrolls sideways when the table is wider
+     than the chat, and a tap opens the fullscreen zoomable view (a squished
+     table is unreadable on a phone). */
+  .md-tablewrap { position:relative; margin:8px 0; border:1px solid var(--line); border-radius:8px;
+    overflow-x:auto; -webkit-overflow-scrolling:touch; max-width:100%; cursor:pointer; }
+  .md-table { border-collapse:collapse; font-size:13px; line-height:1.35; min-width:100%; }
+  .md-table th, .md-table td { border:1px solid var(--line); padding:7px 10px; text-align:left;
+    vertical-align:top; overflow-wrap:anywhere; word-break:break-word; }
+  .md-table th { background:rgba(255,255,255,.05); font-weight:600; white-space:nowrap; }
+  .md-table tbody tr:nth-child(even) td { background:rgba(255,255,255,.02); }
+  .tbl-expand { position:absolute; top:5px; right:5px; z-index:2; pointer-events:none;
+    background:rgba(20,24,29,.9); color:var(--accent); border:1px solid var(--line); border-radius:7px;
+    font-size:10.5px; font-weight:600; padding:3px 7px; }
+  /* fullscreen table viewer */
+  #tblFs { position:fixed; inset:0; z-index:9999; background:var(--bg); display:none; flex-direction:column; }
+  #tblFs.on { display:flex; }
+  #tblFs .fsbar { display:flex; align-items:center; gap:8px; padding:12px 14px;
+    border-bottom:1px solid var(--line); background:var(--panel); flex:none; }
+  #tblFs .fsbar .ttl { flex:1; font-size:14px; font-weight:600; color:var(--muted); }
+  #tblFs .fsbar button { background:none; border:1px solid var(--line); color:var(--fg); border-radius:8px;
+    min-width:40px; height:36px; font-size:16px; font-weight:600; cursor:pointer; padding:0 10px; }
+  #tblFs .fsbar button.x { color:var(--accent); }
+  #tblFs .fsbody { flex:1; min-height:0; overflow:auto; -webkit-overflow-scrolling:touch; padding:14px; }
+  #tblFs .fsbody table { border-collapse:collapse; font-size:var(--fsfs,15px); line-height:1.4; }
+  #tblFs .fsbody th, #tblFs .fsbody td { border:1px solid var(--line); padding:9px 13px;
+    text-align:left; vertical-align:top; }
+  #tblFs .fsbody th { background:rgba(255,255,255,.06); font-weight:600; white-space:nowrap; }
   .msg.error { color:var(--err); }
   .tool { display:flex; align-items:center; gap:8px; font-size:12px; background:rgba(91,141,239,.12);
     color:var(--tool); padding:6px 10px; border-radius:8px; font-family:ui-monospace,monospace;
@@ -975,6 +1002,11 @@ function renderMd(src){
     s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
     return s;
   };
+  // GFM table helpers: split "| a | b |" into cells, detect the "|---|:--:|" rule
+  // row, and read per-column alignment from the colons in that rule.
+  const parseRow = s => s.trim().replace(/^\|/,'').replace(/\|$/,'').split('|').map(c=>c.trim());
+  const isSep = s => { const c=parseRow(s); return c.length>0 && c.every(x=>/^:?-{1,}:?$/.test(x)); };
+  const alignOf = c => { const L=c.startsWith(':'), R=c.endsWith(':'); return L&&R?'center':R?'right':L?'left':''; };
   const lines = String(src||'').replace(/\r/g,'').split('\n');
   let html='', i=0, inCode=false, code='', para=[];
   const flushPara=()=>{ if(para.length){ html+='<div class="md-p">'+para.map(inline).join('<br>')+'</div>'; para=[]; } };
@@ -992,6 +1024,19 @@ function renderMd(src){
     if((m=ln.match(/^\s*(\d+)[.)]\s+(.+)$/))){ flushPara(); html+='<div class="md-li">'+m[1]+'. '+inline(m[2])+'</div>'; i++; continue; }
     if(/^\s*(---+|___+|\*\*\*+)\s*$/.test(ln)){ flushPara(); html+='<hr class="md-hr">'; i++; continue; }
     if(ln.trim()===''){ flushPara(); i++; continue; }
+    // GFM table: a header row that has a "|" and whose NEXT line is a "---" rule.
+    if(ln.indexOf('|')>=0 && i+1<lines.length && isSep(lines[i+1])){
+      flushPara();
+      const header=parseRow(ln), aligns=parseRow(lines[i+1]).map(alignOf), cols=header.length;
+      i+=2; const rows=[];
+      while(i<lines.length && lines[i].trim()!=='' && lines[i].indexOf('|')>=0){ rows.push(parseRow(lines[i])); i++; }
+      const cell=(txt,tag,al)=>'<'+tag+(al?' style="text-align:'+al+'"':'')+'>'+inline(txt||'')+'</'+tag+'>';
+      let t='<div class="md-tablewrap"><span class="tbl-expand">⤢ во весь экран</span><table class="md-table"><thead><tr>';
+      for(let k=0;k<cols;k++) t+=cell(header[k],'th',aligns[k]);
+      t+='</tr></thead><tbody>';
+      for(const r of rows){ t+='<tr>'; for(let k=0;k<cols;k++) t+=cell(r[k],'td',aligns[k]); t+='</tr>'; }
+      html+=t+'</tbody></table></div>'; continue;
+    }
     para.push(ln); i++;
   }
   if(inCode) html+='<pre class="md-pre"><code>'+escHtml(code.replace(/\n$/,''))+'</code></pre>';
@@ -1384,8 +1429,36 @@ function cacheKeyForSW(){
     caches.open('cb-key').then(c=>c.put('/__key', new Response(S.key))).catch(()=>{}); }catch(e){}
 }
 
+// Fullscreen table viewer: tap any rendered table to open it big, scroll both
+// axes, and A−/A+ to change font size (pinch-zoom is disabled page-wide, so this
+// is how you read a wide table comfortably on a phone).
+function initTableFs(){
+  if(document.getElementById('tblFs')) return;
+  const o=document.createElement('div'); o.id='tblFs';
+  o.innerHTML='<div class="fsbar"><button class="x" title="Закрыть">✕</button>'
+    +'<div class="ttl">Таблица</div>'
+    +'<button data-z="-1" title="Меньше">A−</button>'
+    +'<button data-z="1" title="Больше">A+</button></div><div class="fsbody"></div>';
+  document.body.appendChild(o);
+  const body=o.querySelector('.fsbody'); let fs=15;
+  const setFs=v=>{ fs=Math.max(9,Math.min(32,v)); body.style.setProperty('--fsfs',fs+'px'); };
+  const close=()=>o.classList.remove('on');
+  o.querySelector('.x').onclick=close;
+  o.querySelectorAll('[data-z]').forEach(b=>b.onclick=()=>setFs(fs+(b.dataset.z==='1'?2:-2)));
+  o.addEventListener('click',e=>{ if(e.target===o) close(); });
+  document.addEventListener('keydown',e=>{ if(e.key==='Escape') close(); });
+  // A tap on any rendered table opens it fullscreen. A horizontal swipe to scroll
+  // the wrap moves the touch, so the browser suppresses the click — swipe ≠ open.
+  document.addEventListener('click',e=>{
+    const w=e.target.closest && e.target.closest('.md-tablewrap'); if(!w) return;
+    const tbl=w.querySelector('table'); if(!tbl) return;
+    body.innerHTML='<table>'+tbl.innerHTML+'</table>'; setFs(15); o.classList.add('on');
+  });
+}
+
 loadHome();
 autoPush();
+initTableFs();
 clearBadges();
 cacheKeyForSW();
 setInterval(()=>{ if(S.view==='home' || S.drawerOpen) loadHome(); }, 3000);
