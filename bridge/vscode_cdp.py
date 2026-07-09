@@ -172,22 +172,27 @@ async def _read_tab_title(ws_url: str) -> tuple[str, str | None]:
 
 async def list_claude_tabs() -> list[ClaudeTab]:
     """Enumerate live Claude chat webviews. Only renders that CDP has attached
-    show up — background VS Code windows may not appear until focused."""
-    tabs: list[ClaudeTab] = []
-    for t in await _to_thread(_iter_claude_iframe_targets):
-        ws_url = t.get("webSocketDebuggerUrl")
-        if not ws_url:
-            continue
+    show up — background VS Code windows may not appear until focused.
+
+    Reads every webview's title CONCURRENTLY (was serial → ~0.3s × N, which made
+    waking a sleeping tab crawl). A per-read timeout keeps a stale/disposed
+    target from stalling the batch."""
+    targets = [t for t in await _to_thread(_iter_claude_iframe_targets)
+               if t.get("webSocketDebuggerUrl")]
+
+    async def read_one(t: dict) -> "ClaudeTab | None":
+        ws_url = t["webSocketDebuggerUrl"]
         try:
-            title, ok = await _read_tab_title(ws_url)
-            if ok is None:
-                continue
+            title, ok = await asyncio.wait_for(_read_tab_title(ws_url), timeout=3)
         except Exception:
-            title = ""
-        tabs.append(
-            ClaudeTab(target_id=t["id"], ws_url=ws_url, title=title or "(Claude)", url=t.get("url", ""))
-        )
-    return tabs
+            return None
+        if ok is None:
+            return None
+        return ClaudeTab(target_id=t["id"], ws_url=ws_url,
+                         title=title or "(Claude)", url=t.get("url", ""))
+
+    results = await asyncio.gather(*[read_one(t) for t in targets], return_exceptions=True)
+    return [r for r in results if isinstance(r, ClaudeTab)]
 
 
 _TABBAR_JS = r"""

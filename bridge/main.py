@@ -358,18 +358,19 @@ async def _ensure_rendered(uid: str) -> tuple[str | None, str | None]:
         return None, None
     if info.get("ws_url"):
         return info["ws_url"], info.get("session_file")
-    # Sleeping tab: click it in VS Code to render its webview, then find it.
+    # Sleeping tab: click it in VS Code to render its webview, then find it by
+    # matching the (now-rendered) webview title to this tab's session/aria.
+    # list_claude_tabs() now reads all webview titles CONCURRENTLY, so each poll
+    # is ~0.5s instead of ~3s — waking a sleeping tab is quick now.
     if info.get("page_ws_url") and info.get("aria"):
         await vscode_cdp.activate_tab(info["page_ws_url"], info["aria"])
         want_stem = uid if not uid.startswith("tab:") else None
         aria_norm = (info.get("aria") or "").rstrip("…").strip().lower()
-        # A brand-new chat: the tab bar labels it "Claude Code" but its rendered
-        # webview title is "Untitled" — so title-prefix matching never hits and we
-        # used to poll for the full ~30s. Match those fresh titles explicitly.
+        # A brand-new chat is labelled "Claude Code" in the bar but its webview
+        # title is "Untitled" — match those explicitly.
         fresh = aria_norm in ("claude code", "(новый чат)", "новый чат", "")
-        for _ in range(12):
-            await asyncio.sleep(0.4)
-            index = claude_storage.build_title_index()
+        for _ in range(16):
+            index = await _off(claude_storage.build_title_index)
             for rt in await vscode_cdp.list_claude_tabs():
                 sf = claude_storage.match_title(rt.title, index)
                 tnorm = rt.title.rstrip("…").strip().lower()
@@ -382,6 +383,7 @@ async def _ensure_rendered(uid: str) -> tuple[str | None, str | None]:
                     if sf is not None:
                         info["session_file"] = str(sf)
                     return rt.ws_url, info.get("session_file")
+            await asyncio.sleep(0.25)
     return None, info.get("session_file")
 
 
