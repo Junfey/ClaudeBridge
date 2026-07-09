@@ -326,6 +326,7 @@ async function loadHome() {
     S.cdpTabs = (r && r.tabs) || [];
     S.cdpOk = r ? (r.cdp !== false) : true;
     setStatus(true);
+    updateAppBadge();   // keep the icon badge in sync with unread готово/вопрос tabs
     if (S.pendingOpen) {
       const t = S.cdpTabs.find(x => x.target_id === S.pendingOpen);
       S.pendingOpen = null;
@@ -589,8 +590,11 @@ function openCdpTab(tab) {
   S.cdpTarget = tab.target_id;
   S.card=null; S.cardKey='';     // reset any pending-question card from another chat
   S.activeTab = tab.target_id;   // persists after going back → shows the bar + enables forward-swipe
-  // optimistically clear the "готово/unread" mark — the server confirms on next poll
-  const tt = S.cdpTabs.find(x => x.target_id===tab.target_id); if(tt) tt.done=false;
+  // optimistically clear the "готово/вопрос" mark — the server confirms on next
+  // poll — and drop this chat from the icon badge + tray now that you're reading it.
+  const tt = S.cdpTabs.find(x => x.target_id===tab.target_id); if(tt){ tt.done=false; tt.pending=false; }
+  updateAppBadge();
+  closeChatNotif(tab.target_id);
   modeBtn.style.display='inline-block';
   modeBtn.textContent='⚙ …';
   modeBtn.onclick=()=>showModeSheet();
@@ -1469,19 +1473,37 @@ async function autoPush(){
   try{ await enablePush(true); }catch(e){}
 }
 
-// Clear the app-icon badge and dismiss lingering notifications whenever the app
-// is opened/focused — otherwise requireInteraction notifications pile up (the
-// icon badge kept climbing and never dropped).
+// The app-icon badge = number of chats needing attention (готово / вопрос), taken
+// from the LIVE tab list — NOT the notification count. It must persist until you
+// actually READ those chats, so opening the app must not clear it (that was the
+// "badge disappears when I open the app without reading" bug).
+function updateAppBadge(){
+  try{
+    const n = (S.cdpTabs||[]).filter(t => t.done || t.pending).length;
+    if(n>0){ if(navigator.setAppBadge) navigator.setAppBadge(n); }
+    else { if(navigator.clearAppBadge) navigator.clearAppBadge(); }
+  }catch(e){}
+}
+// On app open/focus: dismiss the transient tray alerts and RECOMPUTE the badge
+// from the tabs (do NOT blanket-clear it — unread готово/вопрос chats keep it lit).
 function clearBadges(){
-  try{ if(navigator.clearAppBadge) navigator.clearAppBadge(); }catch(e){}
   try{
     if(navigator.serviceWorker) navigator.serviceWorker.ready
-      .then(reg=>reg.getNotifications().then(ns=>ns.forEach(n=>n.close()))).catch(()=>{});
+      .then(reg=>reg.getNotifications().then(ns=>ns.forEach(n=>{ if(n.tag!=='cb-ack') n.close(); }))).catch(()=>{});
+  }catch(e){}
+  updateAppBadge();
+}
+// Close the tray notification for a chat once you open (read) it.
+function closeChatNotif(targetId){
+  try{
+    if(navigator.serviceWorker) navigator.serviceWorker.ready
+      .then(reg=>reg.getNotifications({tag:targetId}).then(ns=>ns.forEach(n=>n.close()))).catch(()=>{});
   }catch(e){}
 }
 document.addEventListener('visibilitychange', ()=>{
   if(document.hidden) return;
   clearBadges();
+  loadHome();   // refresh the tab list so the badge reflects the CURRENT unread state
   // Mobile freezes timers while backgrounded, so the heartbeat can't detect a
   // dead socket. On return, verify liveness immediately: reconnect now if the
   // socket is gone, else ping to force a fast drop-check.
@@ -1490,7 +1512,7 @@ document.addEventListener('visibilitychange', ()=>{
     else { try{ S.ws.send(JSON.stringify({type:'ping'})); }catch(e){} }
   }
 });
-window.addEventListener('focus', clearBadges);
+window.addEventListener('focus', ()=>{ clearBadges(); loadHome(); });
 
 // Stash the auth key where the service worker can read it, so answering from a
 // push notification works even when the app isn't open.

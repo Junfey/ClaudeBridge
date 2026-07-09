@@ -46,11 +46,14 @@ self.addEventListener('push', (e) => {
   if (Array.isArray(data.actions) && data.actions.length) opts.actions = data.actions;
   e.waitUntil((async () => {
     await self.registration.showNotification(data.title, opts);
-    // App-icon count badge = number of pending notifications (unread chats).
+    // App-icon count badge = number of distinct unread CHATS (one tag per chat),
+    // not the raw notification count, and cleared at 0 — so it matches what the
+    // app itself shows (unread готово/вопрос tabs).
     try {
       const ns = await self.registration.getNotifications();
-      const n = ns.filter(x => x.tag !== 'cb-ack').length || 1;
-      if (self.navigator.setAppBadge) await self.navigator.setAppBadge(n);
+      const tags = new Set(ns.filter(x => x.tag && x.tag !== 'cb-ack').map(x => x.tag));
+      if (tags.size > 0) { if (self.navigator.setAppBadge) await self.navigator.setAppBadge(tags.size); }
+      else if (self.navigator.clearAppBadge) await self.navigator.clearAppBadge();
     } catch (_) {}
   })());
 });

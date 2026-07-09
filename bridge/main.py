@@ -362,13 +362,16 @@ async def cdp_tabs() -> dict:
         # priority over working/done — it needs an answer.
         pending = bool(t.get("pending"))
         # "working" = the session file was written recently (Claude is generating
-        # or running a tool) and it isn't finished/done/waiting. 40s (not 5s) so
-        # the "работает…" badge survives a long tool run (tests/installs) where the
-        # JSONL is quiet for a while; the done/pending icon clears it authoritatively.
+        # or running a tool) and it isn't finished/done/waiting. 120s (not 40s) so
+        # the "работает…" badge survives a LONG tool run — a background build/test
+        # or a `sleep`, where the JSONL is quiet for a minute-plus — instead of a
+        # sleeping tab falsely reading as "спит". VS Code's done/pending icon clears
+        # it authoritatively the moment the turn actually ends, so a wide window
+        # can't leave it stuck on "работает".
         working = False
         if sf and not app_done and not pending:
             try:
-                working = (now - os.path.getmtime(sf) < 40) and not t.get("done")
+                working = (now - os.path.getmtime(sf) < 120) and not t.get("done")
             except OSError:
                 working = False
         out.append({"target_id": t["id"], "title": t["title"], "rendered": t["rendered"],
