@@ -38,6 +38,13 @@ are per-install identity. Only the exe.
 
 ## Hard-won constraints — do not relearn these
 
+- **A session belongs to exactly ONE project. Never look one up unscoped.** Every
+  session JSONL carries an authoritative `cwd`; the `~/.claude/projects/<dir>` name
+  is only a lossy encoding of it. Always resolve through
+  `claude_storage.project_dirs_for_window(window)` + `match_title`, and gate any
+  cached mapping with `session_belongs_to_window()`. A global scan once made a tab
+  latch onto whatever JSONL was growing at that moment — another project's active
+  chat streamed into it, and the wrong mapping got cached permanently.
 - **Never do sync file/network I/O on the event loop.** Any blocking call on a hot
   path (mirror, handshake, tab build) freezes every phone's WS heartbeat →
   "связь потеряна" reconnect loops. Wrap it: `await _off(fn, *args)`.
