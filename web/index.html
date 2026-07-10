@@ -1265,6 +1265,9 @@ async function uploadAttached(){
 // ── voice (Web Speech API, live transcription, auto-restart) ───────
 let recog=null, recognizing=false, manualStop=false;
 const micBtn=$('mic');
+// iOS Safari has no SpeechRecognition at all — hide the button rather than offer
+// one that only ever pops an error.
+if(!(window.SpeechRecognition||window.webkitSpeechRecognition)) micBtn.style.display='none';
 micBtn.onclick=()=>{
   const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
   if(!SR){ alert('Голосовой ввод не поддерживается этим браузером. Открой в Chrome.'); return; }
@@ -1521,7 +1524,15 @@ async function enablePush(silent){
       if(!silent) alert('Этот браузер не поддерживает пуш. Установи приложение на экран Домой.'); return; }
     localStorage.removeItem('pushOff');
     let perm=Notification.permission;
-    if(perm==='default') perm=await Notification.requestPermission();
+    if(perm==='default'){
+      // Safari/iOS REQUIRES a user gesture for requestPermission(); calling it on
+      // page load (autoPush) throws, the error is swallowed, and push then SILENTLY
+      // never enables. So only ever ask from a real tap — otherwise surface a
+      // one-tap bar. (Chrome allows the load-time prompt, but this is better there
+      // too: no prompt the instant the app opens.)
+      if(silent){ showPushBanner(); return; }
+      perm=await Notification.requestPermission();
+    }
     if(perm!=='granted'){ if(!silent) alert('Уведомления отклонены. Разреши их в настройках браузера.'); return; }
     const reg=await navigator.serviceWorker.ready;
     const {publicKey}=await api('/api/push/key');
@@ -1544,6 +1555,17 @@ async function disablePush(){
   }catch(e){ alert('Ошибка: '+e.message); }
 }
 function togglePush(){ if(pushIsOn()) disablePush(); else enablePush(false); }
+// One-tap bar shown when permission is still 'default'. The tap is the user
+// gesture Safari/iOS demands before Notification.requestPermission() may run.
+function showPushBanner(){
+  if($('pushbar') || $('installbar') || localStorage.getItem('pushOff')==='1') return;
+  const bar=document.createElement('div'); bar.id='pushbar'; bar.className='install-bar';
+  bar.innerHTML='<span>🔔 Уведомлять, когда Claude ответит</span>'
+    +'<button id="pbyes">Включить</button><button id="pbno" class="ib-x">×</button>';
+  document.body.appendChild(bar);
+  $('pbyes').onclick=()=>{ bar.remove(); enablePush(false); };   // ← real user gesture
+  $('pbno').onclick=()=>{ localStorage.setItem('pushOff','1'); bar.remove(); };
+}
 // Auto-enable on load unless the user explicitly turned it off.
 async function autoPush(){
   if(localStorage.getItem('pushOff')==='1') return;
