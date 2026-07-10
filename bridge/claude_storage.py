@@ -13,6 +13,7 @@ user and assistant entries for display.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -180,16 +181,99 @@ def _ai_title(path: Path) -> str:
     return title.strip()
 
 
-def build_title_index(max_scan: int = 150) -> list[tuple[str, Path]]:
-    """Return [(ai_title_lower, path), ...] for recent sessions, newest first.
-    Built once per tab-list refresh so we don't re-scan files per tab."""
-    if not CLAUDE_PROJECTS.exists():
+# ── project scoping ────────────────────────────────────────────────────────
+# A session lives at ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl. The directory
+# name is a LOSSY encoding of the cwd, but every event carries the real `cwd`, so
+# that is the authoritative source. A Claude tab belongs to exactly one VS Code
+# window (project folder) and can NEVER own a session from another project.
+# Scoping every session lookup by this makes cross-project bleed impossible —
+# without it, a tab whose title didn't match would latch onto whatever session was
+# growing at that moment, i.e. another project's active chat.
+_DIR_CWD: dict[str, str] = {}
+
+
+def _dir_cwd(d: Path) -> str:
+    """The real working directory a Claude project dir records, read from the `cwd`
+    field of one of its session events. Cached — a dir's cwd never changes. Not
+    cached while empty, so a brand-new project dir is re-read until it has one."""
+    if d.name in _DIR_CWD:
+        return _DIR_CWD[d.name]
+    cwd = ""
+    try:
+        files = sorted(d.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:3]
+    except OSError:
+        files = []
+    for f in files:
+        try:
+            with f.open(encoding="utf-8", errors="replace") as fh:
+                for _ in range(8):
+                    line = fh.readline()
+                    if not line:
+                        break
+                    try:
+                        evt = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if evt.get("cwd"):
+                        cwd = str(evt["cwd"])
+                        break
+        except OSError:
+            continue
+        if cwd:
+            break
+    if cwd:
+        _DIR_CWD[d.name] = cwd
+    return cwd
+
+
+def _folder_name(path: str) -> str:
+    return os.path.basename(str(path).replace("\\", "/").rstrip("/"))
+
+
+def project_dirs_for_window(window: str) -> list[Path]:
+    """Claude project dirs whose sessions were recorded in a folder named `window`
+    (the VS Code window / project name)."""
+    w = (window or "").strip().lower()
+    if not w or not CLAUDE_PROJECTS.exists():
         return []
-    files = sorted(
-        CLAUDE_PROJECTS.glob("*/*.jsonl"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )[:max_scan]
+    out: list[Path] = []
+    try:
+        for d in CLAUDE_PROJECTS.iterdir():
+            if d.is_dir() and _folder_name(_dir_cwd(d)).lower() == w:
+                out.append(d)
+    except OSError:
+        return []
+    return out
+
+
+def session_belongs_to_window(path, window: str) -> bool:
+    """HARD GUARD: a session file may only ever be used for a tab in the SAME
+    project. Checked before trusting a cached mapping and before caching a newly
+    discovered one, so a wrong guess can neither be used nor persist."""
+    w = (window or "").strip().lower()
+    if not w or not path:
+        return False
+    try:
+        return _folder_name(_dir_cwd(Path(path).parent)).lower() == w
+    except Exception:
+        return False
+
+
+def build_title_index(max_scan: int = 150, dirs: list[Path] | None = None) -> list[tuple[str, Path]]:
+    """Return [(ai_title_lower, path), ...] for recent sessions, newest first.
+    `dirs` limits the scan to specific project dirs — always pass the tab's own
+    project: a title then cannot match another project's session, and the global
+    recent-N cap can no longer hide a project's own (older) sessions."""
+    if dirs is None:
+        if not CLAUDE_PROJECTS.exists():
+            return []
+        candidates = list(CLAUDE_PROJECTS.glob("*/*.jsonl"))
+    else:
+        candidates = [f for d in dirs for f in d.glob("*.jsonl")]
+    try:
+        files = sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)[:max_scan]
+    except OSError:
+        return []
     out: list[tuple[str, Path]] = []
     for f in files:
         at = _ai_title(f).lower().rstrip("…").strip()
@@ -198,36 +282,39 @@ def build_title_index(max_scan: int = 150) -> list[tuple[str, Path]]:
     return out
 
 
+_MIN_OVERLAP = 8
+
+
 def match_title(title: str, index: list[tuple[str, Path]]) -> Path | None:
-    """Match a tab title against a prebuilt title index."""
+    """Match a tab title against a prebuilt (project-scoped!) title index.
+
+    An exact match always wins. Otherwise the VS Code tab label is a TRUNCATED
+    prefix of the session's ai-title, so a prefix match is allowed — but only with
+    a meaningful overlap. The old reverse test `norm.startswith(at[:40])` had no
+    length floor, so a one-word ai-title captured almost any tab (and, against the
+    old GLOBAL index, a tab could thereby adopt another project's session)."""
     norm = (title or "").strip().rstrip("…").lower()
     if not norm:
         return None
+    for at, f in index:                       # 1) exact title
+        if at == norm:
+            return f
+    best, best_len = None, 0                  # 2) most specific overlap
     for at, f in index:
-        if at == norm or at.startswith(norm) or norm.startswith(at[:40]):
-            return f
-    return None
-
-
-def find_session_file_by_title(title: str, max_scan: int = 120) -> Path | None:
-    """Map a live CDP tab (by its generated title) to its JSONL file by matching
-    the tab title against each session's ai-title event. Newest files first."""
-    title = (title or "").strip().rstrip("…")
-    if not title or not CLAUDE_PROJECTS.exists():
-        return None
-    files = sorted(
-        CLAUDE_PROJECTS.glob("*/*.jsonl"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )[:max_scan]
-    norm = title.lower()
-    for f in files:
-        at = _ai_title(f).lower().rstrip("…")
-        if not at:
+        if len(norm) >= _MIN_OVERLAP and at.startswith(norm):
+            n = len(norm)                     # label is a prefix of the ai-title
+        elif len(at) >= _MIN_OVERLAP and norm.startswith(at):
+            n = len(at)                       # ai-title is a prefix of the label
+        else:
             continue
-        if at == norm or at.startswith(norm) or norm.startswith(at[:40]):
-            return f
-    return None
+        if n > best_len:
+            best, best_len = f, n
+    return best
+
+
+# NOTE: a global `find_session_file_by_title` used to live here. It scanned EVERY
+# project and was a cross-project bleed vector; it had no callers left. Always go
+# through `build_title_index(dirs=project_dirs_for_window(win))` + `match_title`.
 
 
 def load_history(session_id: str, project_path: str, limit_turns: int = 100) -> list[SessionTurn]:

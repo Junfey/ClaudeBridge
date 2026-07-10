@@ -265,8 +265,17 @@ async def _build_claude_tabs_uncached() -> list[dict]:
     """Unified list of ALL open Claude tabs across windows — rendered or not.
     Identity = session uuid (JSONL stem). Rendered tabs get a ws_url for inject;
     sleeping tabs carry their window + label so we can activate them on demand."""
-    index = await _off(claude_storage.build_title_index)
     info: dict[str, dict] = {}
+    _idx: dict[str, list] = {}   # window -> title index scoped to THAT project
+
+    async def _index_for(window: str) -> list:
+        """Title index limited to the window's OWN Claude project dir(s). Scoping is
+        what makes a tab unable to match (nor later mirror) another project's chat —
+        a global index let a title collide across projects."""
+        if window not in _idx:
+            dirs = await _off(claude_storage.project_dirs_for_window, window)
+            _idx[window] = await _off(claude_storage.build_title_index, 300, dirs) if dirs else []
+        return _idx[window]
 
     def _norm(s: str) -> str:
         return (s or "").strip().rstrip("…").lower()
@@ -281,6 +290,7 @@ async def _build_claude_tabs_uncached() -> list[dict]:
     #    tabs regardless of count (6 or 60) or whether their session is recent.
     wtabs = await vscode_cdp.list_workbench_tabs()
     windows_seen: dict[str, str] = {}  # window name -> its workbench page ws_url
+    claimed: set[str] = set()          # session files already owned by a tab
     for wt in wtabs:
         w = wt.get("window") or ""
         if w and wt.get("page_ws_url") and w not in windows_seen:
@@ -290,16 +300,22 @@ async def _build_claude_tabs_uncached() -> list[dict]:
         # Prefer the clean .tab-label text; fall back to (de-suffixed) aria.
         title = (wt.get("label") or "").strip() or _clean_title(wt.get("aria") or "")
         win = wt.get("window") or ""
-        sf = claude_storage.match_title(title, index)
+        sf = claude_storage.match_title(title, await _index_for(win))
+        # One chat = one tab. If an earlier tab already claimed this session (two
+        # similar titles), the second must NOT reuse it — that would mirror the same
+        # chat into both tabs and silently drop one of them via the uid collision.
+        if sf is not None and (str(sf) in claimed or sf.stem in info):
+            sf = None
         if sf is not None:
+            claimed.add(str(sf))
             uid = sf.stem
-            info.setdefault(uid, {
+            info[uid] = {
                 "id": uid, "title": title, "session_file": str(sf), "ws_url": None,
                 "page_ws_url": wt.get("page_ws_url"), "aria": wt.get("aria") or title,
                 "window": win, "rendered": False, "_norm": _norm(title),
                 "panel": wt.get("panelId") or "", "done": bool(wt.get("done")),
                 "pending": bool(wt.get("pending")),
-            })
+            }
         else:
             # No recent session file matched (old/untitled/brand-new chat). Still
             # list it; the session file resolves via the DOM when tapped open.
@@ -316,23 +332,20 @@ async def _build_claude_tabs_uncached() -> list[dict]:
             })
 
     # 2. Rendered webviews → attach ws_url (enables inject/mirror immediately).
-    #    Correlate by session file when known, else by normalized title.
+    #    Correlate by normalized title against the entries built above. We do NOT
+    #    re-resolve a session file here: pass 1 already did that, scoped to the
+    #    tab's own project. Matching a title against a GLOBAL index here was one of
+    #    the ways a tab picked up another project's session.
     for rt in await vscode_cdp.list_claude_tabs():
-        sf = claude_storage.match_title(rt.title, index)
+        rn = _norm(rt.title)
         target = None
-        if sf is not None and sf.stem in info:
-            target = info[sf.stem]
-        else:
-            rn = _norm(rt.title)
-            for e in info.values():
-                if e.get("_norm") and e["_norm"] == rn:
-                    target = e
-                    break
+        for e in info.values():
+            if e.get("_norm") and e["_norm"] == rn and not e.get("rendered"):
+                target = e
+                break
         if target is not None:
             target["ws_url"] = rt.ws_url
             target["rendered"] = True
-            if sf is not None and not target.get("session_file"):
-                target["session_file"] = str(sf)
 
     # Surface open VS Code windows that have NO Claude tab yet as EMPTY projects,
     # so a freshly-opened folder shows on the phone and you can start its first
@@ -356,8 +369,15 @@ async def _build_claude_tabs_uncached() -> list[dict]:
     for uid, e in info.items():
         if not e.get("session_file"):
             sess = CDP_SESSION.get(uid)
-            if sess and os.path.exists(sess):
+            if not sess:
+                continue
+            # HARD GUARD: a cached mapping from a previous (buggy) cross-project
+            # guess must never be used — and must be purged, or it sticks forever.
+            if not claude_storage.session_belongs_to_window(sess, e.get("window", "")):
+                CDP_SESSION.pop(uid, None)
+            elif os.path.exists(sess) and str(sess) not in claimed:
                 e["session_file"] = sess
+                claimed.add(str(sess))
     for e in info.values():
         e.pop("_norm", None)
     CDP_TABS_INFO.clear()
@@ -437,8 +457,11 @@ async def _ensure_rendered(uid: str) -> tuple[str | None, str | None]:
         # A brand-new chat is labelled "Claude Code" in the bar but its webview
         # title is "Untitled" — match those explicitly.
         fresh = aria_norm in ("claude code", "(новый чат)", "новый чат", "")
+        # Index scoped to THIS tab's project (never another's), built once — not
+        # rebuilt on all 16 poll iterations as before.
+        _dirs = await _off(claude_storage.project_dirs_for_window, info.get("window", ""))
+        index = await _off(claude_storage.build_title_index, 300, _dirs) if _dirs else []
         for _ in range(16):
-            index = await _off(claude_storage.build_title_index)
             for rt in await vscode_cdp.list_claude_tabs():
                 sf = claude_storage.match_title(rt.title, index)
                 tnorm = rt.title.rstrip("…").strip().lower()
@@ -634,17 +657,6 @@ async def ws_cdp(ws: WebSocket, target_id: str) -> None:
                 pass
 
 
-def _resolve_session_file(target_id: str, title: str):
-    from pathlib import Path as _P
-    sess = CDP_SESSION.get(target_id)
-    if sess and _P(sess).exists():
-        return _P(sess)
-    f = claude_storage.find_session_file_by_title(title)
-    if f is not None:
-        CDP_SESSION[target_id] = str(f)
-    return f
-
-
 def _events_to_history(events: list[dict]) -> list[dict]:
     """Flatten JSONL events into simple {role,text} history rows for the phone."""
     out: list[dict] = []
@@ -711,23 +723,35 @@ def _card_key(card: dict) -> str:
             + "|".join(o["label"] for o in card.get("options", [])))
 
 
-def _discover_session_file(baseline: dict) -> tuple[str, int] | None:
+def _discover_session_file(baseline: dict, allowed_dirs: list[str]) -> tuple[str, int] | None:
     """(blocking, run in a thread) Find the chat started in a brand-new tab:
-    a JSONL that appeared since `baseline`, else one grown past its baseline."""
+    a JSONL that appeared since `baseline`, else one grown past its baseline.
+
+    ONLY looks inside `allowed_dirs` — the Claude project dirs belonging to this
+    tab's VS Code window. Scanning every project (the old behaviour) meant a tab
+    whose title didn't match latched onto whatever session happened to be growing
+    right then — i.e. ANOTHER project's active chat — and that wrong mapping was
+    then cached, so one project's conversation streamed into another's tab."""
+    if not allowed_dirs:
+        return None
     newf = grown = None
-    for f in jsonl_watch._all_session_files():
-        fp = str(f)
+    for d in allowed_dirs:
         try:
-            sz = f.stat().st_size
+            files = list(Path(d).glob("*.jsonl"))
         except OSError:
             continue
-        base = baseline.get(fp)
-        if base is None:
-            if sz > 0:
-                newf = (fp, 0)
-                break
-        elif sz > base and grown is None:
-            grown = (fp, base)
+        for f in files:
+            fp = str(f)
+            try:
+                sz = f.stat().st_size
+            except OSError:
+                continue
+            base = baseline.get(fp)
+            if base is None:
+                if sz > 0:
+                    return (fp, 0)     # a file that appeared → the chat started here
+            elif sz > base and grown is None:
+                grown = (fp, base)
     return newf or grown
 
 
@@ -738,7 +762,15 @@ async def _mirror_loop(ws: WebSocket, ws_url: str, target_id: str, lock) -> None
     import time as _t
     from pathlib import Path as _P
 
+    # This tab's project. EVERY session lookup below is confined to it, so another
+    # project's chat can never be mirrored into this tab.
+    window = (CDP_TABS_INFO.get(target_id) or {}).get("window") or ""
+    allowed = [str(d) for d in await _off(claude_storage.project_dirs_for_window, window)]
+
     sess = CDP_SESSION.get(target_id)
+    if sess and not await _off(claude_storage.session_belongs_to_window, sess, window):
+        CDP_SESSION.pop(target_id, None)   # poisoned by an old cross-project guess
+        sess = None
     session_file = _P(sess) if sess else None
     pos = await _off(jsonl_watch.file_size, session_file) if session_file else None
     # For a brand-new tab (no session file yet) remember current file sizes, so we
@@ -765,10 +797,16 @@ async def _mirror_loop(ws: WebSocket, ws_url: str, target_id: str, lock) -> None
             # Discover the session file lazily for a brand-new tab: prefer a file
             # that APPEARED since we started (a fresh chat writes a new JSONL on
             # the first message), else one that grew past its baseline — reading
-            # only the new part. Never replays an unrelated already-active chat.
+            # only the new part. Confined to THIS tab's project, so it can never
+            # latch onto another project's active chat.
             if session_file is None:
-                pick = await _off(_discover_session_file, baseline)
-                if pick:
+                if not allowed:
+                    # A brand-new project's dir only exists once its first message
+                    # is written — re-resolve until it shows up.
+                    allowed = [str(d) for d in
+                               await _off(claude_storage.project_dirs_for_window, window)]
+                pick = await _off(_discover_session_file, baseline, allowed) if allowed else None
+                if pick and await _off(claude_storage.session_belongs_to_window, pick[0], window):
                     session_file = _P(pick[0])
                     CDP_SESSION[target_id] = pick[0]
                     pos = pick[1]
