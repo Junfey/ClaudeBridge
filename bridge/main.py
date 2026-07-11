@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
@@ -77,9 +78,21 @@ def _cid_mark(target_id: str, cid: str | None) -> None:
     if not cid:
         return
     lst = CDP_SEEN_CIDS.setdefault(target_id, [])
+    if cid in lst:
+        return
     lst.append(cid)
     if len(lst) > 100:
         del lst[0 : len(lst) - 100]
+
+
+def _cid_unmark(target_id: str, cid: str | None) -> None:
+    """Release a cid claimed before a send whose inject then FAILED, so the phone's
+    durable-outbox retry can inject it for real (not be dedup'd into a no-op)."""
+    if not cid:
+        return
+    lst = CDP_SEEN_CIDS.get(target_id)
+    if lst and cid in lst:
+        lst.remove(cid)
 
 
 def _cdp_lock(target_id: str) -> "asyncio.Lock":
@@ -583,33 +596,45 @@ async def ws_cdp(ws: WebSocket, target_id: str) -> None:
                 cid = msg.get("cid")
                 if not text and not images:
                     continue
-                # Idempotent resend: if the phone already queued this cid and we
-                # injected it before (ack lost in the drop), just re-ack — never
-                # submit the same task twice.
-                if _cid_is_seen(target_id, cid):
-                    await ws.send_json({"type": "sent", "text": text, "cid": cid})
-                    continue
+                # ATOMIC dedup, under the lock. The phone's durable outbox resends
+                # the same cid on EVERY reconnect; with a laggy tunnel and a slow
+                # send (pasting several images takes seconds) ~10 resends arrived
+                # while the first was still injecting. The old code checked
+                # _cid_is_seen BEFORE the lock and marked only AFTER the inject, so
+                # every one of those resends passed the check and injected again —
+                # the message landed in VS Code ~10×. Now the first arrival CLAIMS
+                # the cid before doing any work, so a resend that lands during the
+                # inject is re-acked (not re-injected); a real failure un-claims it
+                # so a genuine retry still works.
                 async with lock:
-                    # Paste image attachments first (best-effort visual attach).
-                    for p in images[:MAX_FILES]:
+                    already = _cid_is_seen(target_id, cid)
+                    if already:
+                        inj = {"ok": True}
+                    else:
+                        _cid_mark(target_id, cid)  # claim BEFORE the slow work
                         try:
-                            data = Path(p).read_bytes()
-                        except OSError:
-                            continue
-                        import base64
-                        b64 = base64.b64encode(data).decode()
-                        mime = "image/png" if p.lower().endswith(".png") else "image/jpeg"
-                        await vscode_cdp.paste_image(ws_url, b64, mime, os.path.basename(p))
-                        await asyncio.sleep(0.3)
-                    inj = await vscode_cdp.inject_and_submit(ws_url, text or "(см. вложения)", submit=True)
+                            for p in images[:MAX_FILES]:
+                                try:
+                                    data = Path(p).read_bytes()
+                                except OSError:
+                                    continue
+                                b64 = base64.b64encode(data).decode()
+                                mime = "image/png" if p.lower().endswith(".png") else "image/jpeg"
+                                await vscode_cdp.paste_image(ws_url, b64, mime, os.path.basename(p))
+                                await asyncio.sleep(0.3)
+                            inj = await vscode_cdp.inject_and_submit(ws_url, text or "(см. вложения)", submit=True)
+                        except Exception as e:  # noqa: BLE001
+                            inj = {"ok": False, "error": str(e)}
+                        if not inj.get("ok"):
+                            _cid_unmark(target_id, cid)  # let the phone retry for real
                 if inj.get("ok"):
-                    _cid_mark(target_id, cid)  # mark delivered only after a real submit
                     ack = {"type": "sent", "text": text}
                     if cid:
                         ack["cid"] = cid
                     await ws.send_json(ack)
-                    await ws.send_json({"type": "thinking"})
-                    await ws.send_json({"type": "working", "on": True})
+                    if not already:  # a fresh send → announce the new turn
+                        await ws.send_json({"type": "thinking"})
+                        await ws.send_json({"type": "working", "on": True})
                 else:
                     err = {"type": "error", "text": f"inject failed: {inj.get('error')}"}
                     if cid:
