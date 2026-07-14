@@ -87,6 +87,19 @@ except Exception:
 # (you're already looking at that chat).
 ACTIVE: set[str] = set()
 
+# Anti-spam: a session that finished a turn and was pushed about, but hasn't been
+# READ yet. We push a chat AT MOST ONCE per unread episode — otherwise an
+# autonomous loop (/loop, "process queue until empty") that ends a turn every few
+# seconds fires a push each time and buries the phone. Cleared by mark_read() when
+# you open that chat, so the NEXT completion after you've seen it notifies again.
+_NOTIFIED: set[str] = set()
+
+
+def mark_read(key: str) -> None:
+    """Called when you open a chat — you've now seen it, so allow the next
+    completion to push again."""
+    _NOTIFIED.discard(key)
+
 
 def _load_subs() -> list[dict]:
     if _SUBS_FILE.exists():
@@ -190,6 +203,8 @@ async def watcher() -> None:
                     continue
                 if key in ACTIVE:  # you're watching this chat — no push
                     continue
+                if key in _NOTIFIED:  # already pushed & not read yet — don't spam
+                    continue          # (an idle loop keeps ending turns forever)
                 try:
                     events = jsonl_watch.read_events_from(f, prev)
                 except Exception:
@@ -205,6 +220,7 @@ async def watcher() -> None:
                         last_text = e["text"]
                 title = claude_storage._ai_title(f) or "Claude"
                 body = snippet(last_text) if last_text else "Готово ✓"
+                _NOTIFIED.add(key)  # one push per unread episode; mark_read() resets it
                 # fire-and-forget so a slow send doesn't stall the watch loop.
                 # url deep-links to this exact chat (target_id == session uuid).
                 asyncio.create_task(send({

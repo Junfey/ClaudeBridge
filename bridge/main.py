@@ -528,6 +528,7 @@ async def ws_cdp(ws: WebSocket, target_id: str) -> None:
         if session_file:
             CDP_SESSION[target_id] = str(session_file)
             push.ACTIVE.add(str(session_file))  # suppress push while you watch this chat
+            push.mark_read(str(session_file))   # seen it → next completion may push again
         # NOTE: we deliberately do NOT re-activate the tab here. _ensure_rendered
         # already activates a *sleeping* tab (which clears VS Code's done icon as a
         # side effect). A second activation raced with the just-rendered webview,
