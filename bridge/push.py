@@ -11,6 +11,7 @@ import json
 import socket
 import sys
 import threading
+import time
 from pathlib import Path
 
 # This network hands out IPv6 for Google hosts, and Python's requests (no
@@ -93,6 +94,20 @@ ACTIVE: set[str] = set()
 # seconds fires a push each time and buries the phone. Cleared by mark_read() when
 # you open that chat, so the NEXT completion after you've seen it notifies again.
 _NOTIFIED: set[str] = set()
+
+# Session files that are currently OPEN as VS Code Claude tabs (updated by the tab
+# builder in main.py). We push ONLY for these. A background `claude` CLI / cron run
+# — e.g. a task-queue processor that re-invokes claude in ~/Downloads every few
+# seconds — writes session files too, each a NEW uuid with the SAME title, so
+# per-file dedup can't catch it; and the user isn't driving those through the
+# bridge, so they must never push. Empty ⇒ gate off (falls back to the title guard).
+TAB_FILES: set[str] = set()
+
+# Backstop for the empty-TAB_FILES case (CDP briefly down): don't push two chats
+# with the SAME title within this window — squashes a runaway loop that spawns many
+# new session files all titled the same.
+_TITLE_AT: dict[str, float] = {}
+_TITLE_COOLDOWN = 300.0  # seconds
 
 
 def mark_read(key: str) -> None:
@@ -203,6 +218,12 @@ async def watcher() -> None:
                     continue
                 if key in ACTIVE:  # you're watching this chat — no push
                     continue
+                # Push ONLY for real VS Code Claude tabs — never for a background
+                # CLI/cron run (task-queue processor, headless `claude -p`, …). This
+                # is what stopped the ~250/hr "process task queue" flood from
+                # ~/Downloads. Gate off only if we have no tab list yet.
+                if TAB_FILES and key not in TAB_FILES:
+                    continue
                 if key in _NOTIFIED:  # already pushed & not read yet — don't spam
                     continue          # (an idle loop keeps ending turns forever)
                 try:
@@ -219,6 +240,13 @@ async def watcher() -> None:
                     if e.get("type") == "assistant" and e.get("text"):
                         last_text = e["text"]
                 title = claude_storage._ai_title(f) or "Claude"
+                # Same-title flood guard (backstop when TAB_FILES is empty): many new
+                # session files with an identical title can't all push in 5 min.
+                tkey = title.strip().lower()
+                now_m = time.monotonic()
+                if tkey and now_m - _TITLE_AT.get(tkey, 0.0) < _TITLE_COOLDOWN:
+                    continue
+                _TITLE_AT[tkey] = now_m
                 body = snippet(last_text) if last_text else "Готово ✓"
                 _NOTIFIED.add(key)  # one push per unread episode; mark_read() resets it
                 # fire-and-forget so a slow send doesn't stall the watch loop.

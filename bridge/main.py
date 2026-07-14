@@ -395,6 +395,12 @@ async def _build_claude_tabs_uncached() -> list[dict]:
         e.pop("_norm", None)
     CDP_TABS_INFO.clear()
     CDP_TABS_INFO.update(info)
+    # Tell the push watcher which session files are real VS Code tabs, so it never
+    # notifies for background CLI/cron runs. Only replace on a non-empty build so a
+    # transient empty (CDP hiccup) doesn't drop the gate.
+    _tf = {e["session_file"] for e in info.values() if e.get("session_file")}
+    if _tf:
+        push.TAB_FILES = _tf
     return list(info.values())
 
 
